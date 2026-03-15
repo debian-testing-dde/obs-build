@@ -1,0 +1,29 @@
+From: Héctor Orón Martínez <zumbi@debian.org>
+Date: Mon, 5 Mar 2018 01:15:10 +0100
+Subject: HACK: make glibc build
+
+Signed-off-by: Sjoerd Simons <sjoerd.simons@collabora.co.uk>
+Signed-off-by: Héctor Orón Martínez <zumbi@debian.org>
+Forwarded: not-needed, Debian-specific
+Bug-Debian: http://bugs.debian.org/844420
+Last-Update: 2018-08-30
+---
+ build-recipe-debootstrap | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/build-recipe-debootstrap b/build-recipe-debootstrap
+index b18b6da..1334df5 100644
+--- a/build-recipe-debootstrap
++++ b/build-recipe-debootstrap
+@@ -75,6 +75,11 @@ recipe_build_debootstrap() {
+         cp $BUILD_ROOT/etc/hosts $BUILD_ROOT/$myroot/etc/hosts
+     fi
+ 
++
++    # Hack for glibc build, make localhost. resolve
++    echo "127.0.0.2 localhost."  >> $BUILD_ROOT/$myroot/etc/hosts
++    cat $BUILD_ROOT/$myroot/etc/hosts
++
+     # Mount special filesystem in the debootstrap build root
+     mount -n -tproc none $BUILD_ROOT/$myroot/proc
+     mount -n -tsysfs -o ro none $BUILD_ROOT/$myroot/sys

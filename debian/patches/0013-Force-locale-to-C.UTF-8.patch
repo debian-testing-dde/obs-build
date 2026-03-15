@@ -1,0 +1,32 @@
+From: Emanuele Aina <emanuele.aina@collabora.com>
+Date: Mon, 12 Apr 2021 12:10:17 +0200
+Subject: Force locale to C.UTF-8
+
+Multiple packages have run into build failures on our OBS. On closer
+inspection, it was concluded to be issues with the locale settings.
+
+These issues were never seen on the Debian buildd infrastructure because
+there the locale setting LC_ALL=C.UTF-8 is in use.
+
+This change keeps us closer to what is used in Debian buildds.
+
+https://github.com/openSUSE/obs-build/pull/665
+
+Signed-off-by: Emanuele Aina <emanuele.aina@collabora.com>
+---
+ build-pkg-deb | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/build-pkg-deb b/build-pkg-deb
+index c5c6db0..94bcac3 100644
+--- a/build-pkg-deb
++++ b/build-pkg-deb
+@@ -37,7 +37,7 @@ deb_chroot ()
+ 	cd $1 &&
+ 	    DEBIAN_FRONTEND=noninteractive DEBIAN_PRIORITY=critical \
+ 			   DEBCONF_NONINTERACTIVE_SEEN=true \
+-			   LC_ALL=C LANGUAGE=C LANG=C \
++			   LC_ALL=C.UTF-8 LANGUAGE=C.UTF-8 LANG=C.UTF-8 \
+ 			   chroot $*
+     )
+ }

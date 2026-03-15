@@ -1,0 +1,274 @@
+obs-build (20210120-4obs3) unstable; urgency=medium
+
+  * Backport upstream APK helper modules needed by OBS backend publish
+    helpers:
+    - Build::Apk.pm
+    - Build::Apkv3.pm
+  * Keep the legacy /usr/lib/build compatibility symlink.
+
+ -- hao <hao@local>  Sun, 15 Mar 2026 16:40:00 +0800
+
+obs-build (20210120-4obs2) unstable; urgency=medium
+
+  * Add Debian testing codename links for newer releases:
+    - trixie
+    - forky
+  * Restore the legacy /usr/lib/build compatibility symlink expected by
+    OBS backend daemons.
+
+ -- hao <hao@local>  Sun, 15 Mar 2026 15:00:00 +0800
+
+obs-build (20210120-4) unstable; urgency=medium
+
+  * Ensure the build environment is set up correctly:
+    - Wrap chroot + su in a function to consistently set up environment
+      for builds.
+      Since "su -" cleans the environment, we need to tell it to keep
+      variables we want to preserve. To make this easier, create a new wrapper
+      su_deb_chroot that runs chroot and su and sets up the environment.
+
+ -- Andrej Shadura <andrewsh@debian.org>  Fri, 11 Nov 2022 11:45:36 +0100
+
+obs-build (20210120-3) unstable; urgency=medium
+
+  * Refresh 0007-deb-Show-version-of-each-package-that-we-preinstall.patch.
+
+ -- Andrej Shadura <andrewsh@debian.org>  Sun, 03 Apr 2022 00:00:19 +0200
+
+obs-build (20210120-2) unstable; urgency=medium
+
+  * Add a new changelog entry for Debian packages.
+  * init_buildsystem: Move hostname ip entry to the end of /etc/hosts
+    (Closes: #990278)
+  * Fix config symlinks (Closes: #910150)
+
+ -- Andrej Shadura <andrewsh@debian.org>  Fri, 01 Apr 2022 15:35:20 +0200
+
+obs-build (20210120-1) unstable; urgency=medium
+
+  [ Mike Gabriel ]
+  * New upstream release.
+  * debian/patches:
+    + Trivial rebase of several patches.
+    + Drop build-recipe-dsc-Move-all-build-results-not-just-.deb-and.patch and
+      debootstrap-add-fallback-for-Debian-SID-distro.patch. Applied upstream.
+    + Manually rebase build-recipe-dsc-List-contents-of-build-results.patch
+      and deb-Show-version-of-each-package-that-we-preinstall.patch.
+  * debian/{control,compat}:
+    + Switch to debhelper-compat notation and bump DH compat level to
+      version 13.
+  * debian/control:
+    + Add B-Ds (for unit testing flatpak integration): libfindbin-libs-perl
+      and libyaml-libyaml-perl.
+  * debian/docs:
+    + README -> README.md.
+
+  [ Andrew Lee (李健秋) ]
+  * Fall back to stable if lsb reports a non-supported dist in debootstrap.
+
+  [ Emanuele Aina ]
+  * Force LC_ALL=C.UTF-8 when creating the chroot.
+  * Force the local timezone to be UTC.
+  * Unset $TERM to prevent unexpectedly colorized output from breaking builds.
+
+ -- Andrej Shadura <andrewsh@debian.org>  Wed, 01 Dec 2021 16:25:48 +0100
+
+obs-build (20190710-1) unstable; urgency=medium
+
+  [ Héctor Orón Martínez ]
+  * New usptream release.
+
+  [ Andrej Shadura ]
+  * Use Python 3 with the openstack console.
+  * Add the missing python3-websocket dependency.
+
+ -- Andrej Shadura <andrewsh@debian.org>  Thu, 06 Aug 2020 10:51:49 +0200
+
+obs-build (20180831-4) unstable; urgency=medium
+
+  [ Matthias Klose ]
+  * Use python2 instead of python (Closes: #966765).
+
+  [ Andrej Shadura ]
+  * Update the co-maintainers list.
+
+ -- Andrej Shadura <andrewsh@debian.org>  Thu, 06 Aug 2020 10:24:20 +0200
+
+obs-build (20180831-3) unstable; urgency=medium
+
+  [ Simon McVittie ]
+  * d/p/deb-Install-policy-rc.d-to-prevent-services-from-starting.patch:
+    Replace my patch adding policy-rc.d with an equivalent upstreamed patch
+  * d/p/build-recipe-dsc-Move-all-build-results-not-just-.deb-and.patch:
+    In build-recipe-dsc, keep all build results (including *.udeb, *.ddeb
+    and *.buildinfo), not just *.deb and *.changes (upstream PR #496)
+  * d/p/Log-the-version-number-during-startup.patch,
+    d/p/debootstrap-Print-the-exact-command-we-re-going-to-run.patch,
+    d/p/deb-Show-version-of-each-package-that-we-preinstall.patch,
+    d/p/build-recipe-dsc-Show-information-about-the-build-chroot.patch:
+    Put more information about the build environment in the build log
+    (upstream PR #497)
+  * d/p/build-recipe-dsc-List-contents-of-build-results.patch:
+    List the metadata and contents of the build products in the build log
+    (upstream PR #497)
+  * d/rules: Use the Debian package's version number as the version that
+    will be logged by d/p/Log-the-version-number-during-startup.patch
+
+ -- Héctor Orón Martínez <zumbi@debian.org>  Sun, 01 Sep 2019 01:59:08 +0200
+
+obs-build (20180831-2) unstable; urgency=medium
+
+  [ Ondřej Nový ]
+  * d/copyright: Use https protocol in Format field
+
+  [ Héctor Orón Martínez ]
+  * debian/control: build depend on libtimedate-perl for tests
+    (Closes: #912048)
+
+ -- Héctor Orón Martínez <zumbi@debian.org>  Sat, 22 Dec 2018 01:19:36 +0100
+
+obs-build (20180831-1) unstable; urgency=medium
+
+  * New upstream release.
+  * Drop patches already applied upstream.
+  * Release Debian version 20180831-1.
+
+ -- Andrew Lee (李健秋) <ajqlee@debian.org>  Wed, 19 Sep 2018 14:58:42 +0800
+
+obs-build (20180302-4) unstable; urgency=medium
+
+  [ Simon McVittie ]
+  * d/control: Add Vcs-Git, Vcs-Browser fields pointing to salsa.d.o
+  * Refresh patches through gbp pq import; gbp pq export
+  * d/control: Suggest btrfs-progs instead of deprecated btrfs-tools.
+    Thanks to Paul Wise (Closes: #900455)
+
+  [ Andrew Lee (李健秋) ]
+  * Added DEP-3 compliant headers in all patches
+
+  [ Simon McVittie ]
+  * Added policy-rc.d that turns invoke-rc.d into a no-op
+
+  [ Andrew Lee (李健秋) ]
+  * Fix a typo in patch descriptions.
+  * Release Debian version 20180302-4.
+
+ -- Andrew Lee (李健秋) <ajqlee@debian.org>  Tue, 04 Sep 2018 18:08:54 +0800
+
+obs-build (20180302-3) unstable; urgency=medium
+
+  * configs: Add Debian configurations
+  * debian/control: set new maintainer.
+    Thanks to Christoph Biedl for pointing out the issue (Closes: #899944)
+
+ -- Héctor Orón Martínez <zumbi@debian.org>  Thu, 24 May 2018 11:20:21 +0200
+
+obs-build (20180302-2) unstable; urgency=medium
+
+  * debian/patches: avoid source package rebuilds
+  * debian/patches: add fallback for Debian SID
+  * debian/gbp.conf: add gbp configuration file
+  * debian/control: recommend xzdec for arch linux support
+
+ -- Héctor Orón Martínez <zumbi@debian.org>  Tue, 06 Mar 2018 00:55:57 +0100
+
+obs-build (20180302-1) unstable; urgency=medium
+
+  * New upstream release
+  * debian/patches: refresh and fix current builds
+  * debian/patches: update
+  * debian/control: bump standard version, replace priority
+  * debian/control: add recommends and suggests (Closes: #887173)
+    - add e2fsprogs as recommends and suggest btrfs and xfs tools.
+  * Fixes CVE-2017-14804:
+    - Exploit extractbuild to write to files in the host system
+    (Closes: #887306)
+  * debian/control: add python depend per openstack-console script.
+  * debian/rules: fixup build-vm-openstack execution.
+
+ -- Héctor Orón Martínez <zumbi@debian.org>  Mon, 05 Mar 2018 01:40:32 +0100
+
+obs-build (20170201-3) unstable; urgency=medium
+
+  [ Sjoerd Simons ]
+  * Added a selection of patches to improve full-distro builds:
+    - dsc-Keep-everything.patch
+    - deboostrap-Enable-dpkg-unsafe-io-usage.patch
+    - HACK-Make-glibc-build.patch
+    - debootstrap-generate-apt-caches.patch
+
+  [ Andrew Lee (李健秋) ]
+  * Added depends to sudo, libarchive-tools. (Closes: #866580)
+  * debian/source/options: drop no-preparation as it breaks pbuilder.
+
+ -- Andrew Lee (李健秋) <ajqlee@debian.org>  Sat, 05 Aug 2017 05:24:36 +0800
+
+obs-build (20170201-2) unstable; urgency=medium
+
+  * Refine exist and import new patches:
+    - 0001-Correct-debootstrap-log-path.patch (Closes: #854563)
+    - 0002-deb-Force-unsafe-io-when-install-packages.patch
+    - 0003-snapcraft-Drop-duplicated-code.patch
+    - 0004-livebuild-Only-create-symlinks-after-dpkg-scanpackag.patch
+    - 0005-debootstrap-Ensure-etc-hosts-exists.patch
+    - 0006-debootstrap-Mount-virtual-filesystems-in-the-deboots.patch
+      (Closes: 854557)
+    - 0007-debootstrap-Always-try-to-unmount-binfmt_misc.patch
+      (Closes: #854559)
+    - 0008-debootstrap-Improve-devpts-mounting.patch (Closes: #854558)
+  * Add patch to prevent creation of an empty rcS.
+
+ -- Andrew Lee (李健秋) <ajqlee@debian.org>  Fri, 17 Feb 2017 19:40:45 +0800
+
+obs-build (20170201-1) unstable; urgency=medium
+
+  * New upstream release. (Closes: #853145)
+  * Refreshed 0001-Use-obs-build-in-locations-and-executable-names-inst.patch.
+  * Fix debootstrap recipe fails when building for xenial: (Closes: #853144)
+    - 0001-snapcraft-Drop-duplicated-code.patch
+    - 0002-livebuild-Only-create-symlinks-after-dpkg-scanpackag.patch
+  * Fix debootstrap build chroot not completely setup: (Closes: #853292)
+    - 0001-debootstrap-Ensure-etc-hosts-exists.patch
+    - 0002-debootstrap-Mount-virtual-filesystems-in-the-deboots.patch
+  * debian/rules: drop not executable fix that already included upstream.
+
+ -- Andrew Lee (李健秋) <ajqlee@debian.org>  Thu, 02 Feb 2017 21:45:10 +0800
+
+obs-build (20160921-1) unstable; urgency=medium
+
+  [ Andrew Lee (李健秋) ]
+  * New upstream release. (Closes: #786404, #796522)
+  * Drop 0002-Fix-Build-Zypp-parsecfg-expected-full-config-file-na.patch:
+    included upstream.
+  * Refreshed 0001-Use-obs-build-in-locations-and-executable-names-inst.patch.
+  * Bump standard-version to 3.9.8.
+  * debian/control: Added misc depends.
+  * debian/control: depends on debootstrap.
+  * debian/copyright: added missing gpl-2 and gpl-3 licenses paragraph.
+
+  [ Héctor Orón Martínez ]
+  * debian/control: add new maintainership to RPM packaging team
+  * debian/control: add new uploaders Andrew and myself
+
+ -- Héctor Orón Martínez <zumbi@debian.org>  Fri, 23 Sep 2016 15:49:42 +0200
+
+obs-build (20141024-1.1) unstable; urgency=medium
+
+  * Non-maintainer upload.
+  * 0010_find-perm_slash.diff: Use "find -perm /x" instead of "find -perm +x".
+    Closes: #808918
+
+ -- Andreas Metzler <ametzler@debian.org>  Tue, 29 Dec 2015 14:21:18 +0100
+
+obs-build (20141024-1) unstable; urgency=medium
+
+  * New upstream snapshot.
+  * Update copyright, explicit GPL 2 or 3.
+
+ -- Dimitri John Ledkov <dimitri.j.ledkov@linux.intel.com>  Sat, 25 Oct 2014 02:30:05 +0100
+
+obs-build (20140918-1) unstable; urgency=medium
+
+  * Initial release. (Closes: #762949)
+
+ -- Dimitri John Ledkov <dimitri.j.ledkov@linux.intel.com>  Wed, 01 Oct 2014 11:46:00 +0100

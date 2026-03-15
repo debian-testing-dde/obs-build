@@ -1,0 +1,8 @@
+usr/lib/obs-build/configs/sl11.1.conf usr/lib/obs-build/configs/sles11.conf
+usr/lib/obs-build/configs/debian-unstable.conf usr/lib/obs-build/configs/bookworm.conf
+usr/lib/obs-build/configs/debian-unstable.conf usr/lib/obs-build/configs/bullseye.conf
+usr/lib/obs-build/configs/debian-unstable.conf usr/lib/obs-build/configs/buster.conf
+usr/lib/obs-build/configs/debian-unstable.conf usr/lib/obs-build/configs/stretch.conf
+usr/lib/obs-build/configs/debian-unstable.conf usr/lib/obs-build/configs/trixie.conf
+usr/lib/obs-build/configs/debian-unstable.conf usr/lib/obs-build/configs/forky.conf
+usr/lib/obs-build usr/lib/build

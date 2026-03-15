@@ -1,0 +1,98 @@
+From: Simon McVittie <smcv@collabora.com>
+Date: Mon, 12 Nov 2018 17:29:03 +0000
+Subject: Log the version number during startup
+
+When testing OBS behaviour changes, it's useful to be able to look
+at a build log and see which code was running.
+
+Signed-off-by: Simon McVittie <smcv@collabora.com>
+Forwarded: https://github.com/openSUSE/obs-build/pull/497
+---
+ Makefile         | 12 +++++++++++-
+ build            |  2 ++
+ common_functions |  2 ++
+ init_buildsystem |  2 ++
+ 4 files changed, 17 insertions(+), 1 deletion(-)
+
+diff --git a/Makefile b/Makefile
+index 5243e71..2b3a6d4 100644
+--- a/Makefile
++++ b/Makefile
+@@ -20,13 +20,22 @@ sysconfdir=/etc
+ DESTDIR=
+ 
+ all:
++ifeq ($(SCM),svn)
++	echo $(VERSION)$(SVNVER) > version
++else
++ifeq ($(SCM),git)
++	echo $(VERSION)_git$(DATE) > version
++else
++	echo $(VERSION) > version
++endif
++endif
+ 
+ .PHONY:	test
+ 
+ test:
+ 	PERL5LIB=. prove -v
+ 
+-install:
++install: all
+ 	install -m755 -d \
+ 	    $(DESTDIR)$(pkglibdir)/configs \
+ 	    $(DESTDIR)$(pkglibdir)/baselibs_configs \
+@@ -90,6 +99,7 @@ install:
+ 	install -m644 build-recipe build-recipe-* $(DESTDIR)$(pkglibdir)
+ 	install -m644 build-pkg build-pkg-* $(DESTDIR)$(pkglibdir)
+ 	install -m644 *.pm $(DESTDIR)$(pkglibdir)
++	install -m644 version $(DESTDIR)$(pkglibdir)
+ 	install -m644 configs/* $(DESTDIR)$(pkglibdir)/configs
+ 	install -m644 baselibs_configs/* $(DESTDIR)$(pkglibdir)/baselibs_configs
+ 	install -d $(DESTDIR)$(man1dir)
+diff --git a/build b/build
+index d583b00..8081156 100755
+--- a/build
++++ b/build
+@@ -128,6 +128,7 @@ umask 022
+ 
+ echo_help () {
+     cat << EOT
++build version: $BUILD_VERSION
+ 
+ Some comments for build
+ -----------------------
+@@ -1266,6 +1267,7 @@ for RECIPEFILE in "${RECIPEFILES[@]}" ; do
+     if test -z "$RUNNING_IN_VM" ; then
+ 	echo
+ 	echo "$HOST started \"build $RECIPEFILE\" at `date --utc`."
++	echo "build version: $BUILD_VERSION"
+ 	echo
+ 	test -n "$REASON" && echo "$REASON"
+ 	echo
+diff --git a/common_functions b/common_functions
+index 506747c..04f22e2 100755
+--- a/common_functions
++++ b/common_functions
+@@ -20,6 +20,8 @@
+ #
+ ################################################################
+ 
++BUILD_VERSION="$(cat "$BUILD_DIR/version")"
++
+ build_host_arch() {
+     : ${BUILD_HOST_ARCH:=`uname -m`}
+     # the linux kernel only knows armv7l, armv7hl is a userland definition
+diff --git a/init_buildsystem b/init_buildsystem
+index a2fe05a..d362bc7 100755
+--- a/init_buildsystem
++++ b/init_buildsystem
+@@ -509,6 +509,8 @@ getcachedir() {
+     done
+ }
+ 
++echo "init_buildsystem version: $BUILD_VERSION"
++
+ set_build_arch
+ 
+ trap fail_exit EXIT

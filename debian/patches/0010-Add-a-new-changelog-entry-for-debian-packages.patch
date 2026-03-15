@@ -1,0 +1,56 @@
+From: Sjoerd Simons <sjoerd.simons@collabora.co.uk>
+Date: Thu, 23 Feb 2017 15:29:35 +0100
+Subject: Add a new changelog entry for debian packages
+
+Rather then hacking up the current top changelog entry with a new
+version, add a generated entry at the top. Also do this in all cases a
+release tag has been set not just if the control file has the magic tag.
+
+As a further change, this uses the release tag directly rather then
+prefixing it with +, as that works in all cases e.g. 1-1+build1 is
+considered a higher version than 1-1ubuntu2+build1 by the Debian tools
+(+, unlike ~, isn't considered special).
+
+Signed-off-by: Sjoerd Simons <sjoerd.simons@collabora.co.uk>
+---
+ build-recipe-dsc | 21 ++++++++++++++++++---
+ 1 file changed, 18 insertions(+), 3 deletions(-)
+
+diff --git a/build-recipe-dsc b/build-recipe-dsc
+index 428a737..b6f998b 100644
+--- a/build-recipe-dsc
++++ b/build-recipe-dsc
+@@ -70,15 +70,30 @@ recipe_prepare_dsc() {
+     chroot $BUILD_ROOT su -c "dpkg-source -x $DEB_SOURCEDIR/$DEB_DSCFILE $TOPDIR/BUILD" - $BUILD_USER
+ 
+     # Alternative to debtransform: apply OBS release number if tag OBS-DCH-RELEASE is set.
+-    if test -z "$DEB_TRANSFORM" && grep -Eq '^OBS-DCH-RELEASE: 1' $BUILD_ROOT$TOPDIR/SOURCES/$RECIPEFILE; then
+-        OBS_DCH_RELEASE="+$DEB_RELEASE"
++    if test -z "$DEB_TRANSFORM" -a -n "$DEB_RELEASE"; then
++	if grep -Eq '^OBS-DCH-RELEASE: 1' $BUILD_ROOT$TOPDIR/SOURCES/$RECIPEFILE; then
++	        OBS_DCH_RELEASE="+$DEB_RELEASE"
++	else
++	        OBS_DCH_RELEASE="$DEB_RELEASE"
++	fi
+         chroot $BUILD_ROOT su -c /bin/sh <<EOF
+ cd $TOPDIR/BUILD
+ [ ! -f debian/changelog ] && exit 0
+ # avoid devscripts dependency and mimic dch
+ PACKAGE=\$(dpkg-parsechangelog 2> /dev/null | grep -E '^Source:'  | awk '{ print \$NF }')
+ VERSION=\$(dpkg-parsechangelog 2> /dev/null | grep -E '^Version:' | awk '{ print \$NF }')
+-sed -i "s/\${PACKAGE} (\${VERSION})/\${PACKAGE} (\${VERSION}$OBS_DCH_RELEASE)/" debian/changelog
++DISTRO=\$(dpkg-parsechangelog 2> /dev/null | grep -E '^Distribution:' | awk '{ print \$NF }')
++URGENCY=\$(dpkg-parsechangelog 2> /dev/null | grep -E '^Urgency:' | awk '{ print \$NF }')
++DATE=\$(dpkg-parsechangelog 2> /dev/null | grep -E '^Date:' | awk '{ \$1=""; print substr(\$0,2) }')
++
++echo "\${PACKAGE} (\${VERSION}${OBS_DCH_RELEASE}) \${DISTRO}; urgency=\${URGENCY}" > .changelog.tmp
++echo "" >> .changelog.tmp
++echo "  * OBS build ${OBS_DCH_RELEASE}" >> .changelog.tmp
++echo "" >> .changelog.tmp
++echo " -- OBS Build <obs@buildd>  \${DATE}" >> .changelog.tmp
++echo "" >> .changelog.tmp
++cat debian/changelog >> .changelog.tmp
++mv .changelog.tmp debian/changelog
+ EOF
+     fi
+ 

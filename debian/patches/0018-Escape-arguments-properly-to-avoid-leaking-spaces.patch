@@ -1,0 +1,28 @@
+From: Andrej Shadura <andrew.shadura@collabora.co.uk>
+Date: Thu, 10 Nov 2022 15:42:31 +0100
+Subject: Escape arguments properly to avoid leaking spaces
+
+Signed-off-by: Andrej Shadura <andrew.shadura@collabora.co.uk>
+---
+ build-pkg-deb | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/build-pkg-deb b/build-pkg-deb
+index e18b5be..8bca1a6 100644
+--- a/build-pkg-deb
++++ b/build-pkg-deb
+@@ -34,12 +34,12 @@ deb_chroot ()
+     # when doing a 'chroot /' call lets subshell and change dir manually
+     #
+     (
+-	cd $1 &&
++	cd "$1" &&
+ 	    DEBIAN_FRONTEND=noninteractive DEBIAN_PRIORITY=critical \
+ 			   DEBCONF_NONINTERACTIVE_SEEN=true \
+ 			   LC_ALL=C.UTF-8 LANGUAGE=C.UTF-8 LANG=C.UTF-8 \
+ 			   TZ=UTC \
+-			   chroot $*
++			   chroot "$@"
+     )
+ }
+ 

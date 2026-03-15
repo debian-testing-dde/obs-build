@@ -1,0 +1,30 @@
+From: Emanuele Aina <emanuele.aina@collabora.com>
+Date: Mon, 12 Apr 2021 12:11:33 +0200
+Subject: Unset $TERM to prevent unexpectedly colorized output from breaking builds
+
+Our OBS workers run under a `screen` session, which gives them an actual
+`$TERM` variable.
+
+Some packages like `color.js` then enable colored output, which confuses
+some other packages like `node-grunt-legacy-log` which use it in their
+testsuite and do not expect colored output.
+
+To avoid that, unset `TERM`.
+
+Signed-off-by: Emanuele Aina <emanuele.aina@collabora.com>
+---
+ build | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/build b/build
+index 8081156..5a4154c 100755
+--- a/build
++++ b/build
+@@ -121,6 +121,7 @@ export YAST_IS_RUNNING=instsys
+ # https://github.com/systemd/systemd/blob/master/docs/ENVIRONMENT.md
+ export SYSTEMD_OFFLINE=1
+ 
++unset TERM # prevent unexpectedly colorized output from breaking builds
+ unset LANGUAGE
+ unset LANG
+ export LC_ALL=POSIX

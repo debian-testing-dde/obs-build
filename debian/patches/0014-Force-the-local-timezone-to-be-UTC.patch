@@ -1,0 +1,24 @@
+From: Emanuele Aina <emanuele.aina@collabora.com>
+Date: Mon, 12 Apr 2021 12:17:25 +0200
+Subject: Force the local timezone to be UTC
+
+To make the build environment a bit more reproducible, ensure the local
+timezone is set to UTC when building packages.
+
+Signed-off-by: Emanuele Aina <emanuele.aina@collabora.com>
+---
+ build-pkg-deb | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/build-pkg-deb b/build-pkg-deb
+index 94bcac3..d4c3187 100644
+--- a/build-pkg-deb
++++ b/build-pkg-deb
+@@ -38,6 +38,7 @@ deb_chroot ()
+ 	    DEBIAN_FRONTEND=noninteractive DEBIAN_PRIORITY=critical \
+ 			   DEBCONF_NONINTERACTIVE_SEEN=true \
+ 			   LC_ALL=C.UTF-8 LANGUAGE=C.UTF-8 LANG=C.UTF-8 \
++			   TZ=UTC \
+ 			   chroot $*
+     )
+ }

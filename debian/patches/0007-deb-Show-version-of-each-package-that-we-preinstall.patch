@@ -1,0 +1,25 @@
+From: Simon McVittie <smcv@collabora.com>
+Date: Mon, 12 Nov 2018 17:08:17 +0000
+Subject: deb: Show version of each package that we preinstall
+
+If packages fail to unpack or configure during the preinstall step,
+it's useful for the log to indicate precisely which packages were used.
+
+Signed-off-by: Simon McVittie <smcv@collabora.com>
+Forwarded: https://github.com/openSUSE/obs-build/pull/497
+---
+ build-pkg-deb | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/build-pkg-deb b/build-pkg-deb
+index 46f5f91..c5c6db0 100644
+--- a/build-pkg-deb
++++ b/build-pkg-deb
+@@ -146,6 +146,7 @@ pkg_preinstall_deb() {
+     elif test -f "control.tar.xz" -a ! -L "control.tar.xz" ; then
+ 	$TAR -C "$BUILD_INIT_CACHE/scripts/control" -J -f control.tar.xz
+     fi
++    grep '^Version:' "$BUILD_INIT_CACHE/scripts/control/control" || echo 'Version: unknown'
+     if test -f "data.tar.gz" -a ! -L "data.tar.gz" ; then
+ 	$TAR -z -f data.tar.gz
+     elif test -f "data.tar.xz" -a ! -L "data.tar.xz" ; then

@@ -1,0 +1,30 @@
+From: Andrew Lee (李健秋) <ajqlee@debian.org>
+Date: Fri, 4 Oct 2019 15:48:44 +0800
+Subject: Fallback to stable if lsb reports a non-supported dist in debootstrap
+
+We have a issue that cause all package FTBFS in OBS when the base-files
+updated to a dist name that not supported in debootstrap.
+
+If lsb reported a non-supported dist, we fallback it to stable to avoid
+FTBFS in OBS.
+
+Signed-off-by: Andrew Lee (李健秋) <andrew.lee@collabora.co.uk>
+---
+ build-recipe-debootstrap | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/build-recipe-debootstrap b/build-recipe-debootstrap
+index cd0bc61..064be36 100644
+--- a/build-recipe-debootstrap
++++ b/build-recipe-debootstrap
+@@ -35,6 +35,10 @@ recipe_build_debootstrap() {
+         local dist=unstable
+     else
+         local dist=$(chroot $BUILD_ROOT su -c "lsb_release --codename --short")
++        if [ ! -f "$BUILD_ROOT/usr/share/debootstrap/scripts/$dist" ]
++        then
++            dist=stable
++        fi
+     fi
+     local myroot=debootstraproot
+     test -d $BUILD_ROOT/.build.binaries || cleanup_and_exit 1

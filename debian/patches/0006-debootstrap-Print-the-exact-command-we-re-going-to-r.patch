@@ -1,0 +1,32 @@
+From: Simon McVittie <smcv@collabora.com>
+Date: Mon, 12 Nov 2018 16:58:56 +0000
+Subject: debootstrap: Print the exact command we're going to run
+
+debootstrap is not a simple command, and there are some subtleties to
+the options we use, so we should log exactly what we did.
+
+The incantation with `$(printf ' %q' "$@")` is to log the contents
+of $@, correctly shell-quoted to avoid ambiguity (in case there are
+spaces in an argument). It should expand to something like
+
+    running debootstrap: chroot /buildroot debootstrap --etc --etc...
+
+Signed-off-by: Simon McVittie <smcv@collabora.com>
+Forwarded: https://github.com/openSUSE/obs-build/pull/497
+---
+ build-recipe-debootstrap | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/build-recipe-debootstrap b/build-recipe-debootstrap
+index 1334df5..cd0bc61 100644
+--- a/build-recipe-debootstrap
++++ b/build-recipe-debootstrap
+@@ -55,7 +55,7 @@ recipe_build_debootstrap() {
+     fi
+ 
+     set -- chroot $BUILD_ROOT debootstrap --keep-debootstrap-dir --no-check-gpg --variant=buildd --arch="${arch}" --include="$FULL_PKG_LIST" "$dist" "$myroot" file:///.build.binaries
+-    echo "running debootstrap..."
++    echo "running debootstrap:$(printf ' %q' "$@")..."
+     if ! "$@" || ! chroot $BUILD_ROOT dpkg --configure -a; then
+         cat $BUILD_ROOT/$myroot/debootstrap/debootstrap.log
+         cleanup_and_exit 1 "Failed to setup debootstrap chroot"

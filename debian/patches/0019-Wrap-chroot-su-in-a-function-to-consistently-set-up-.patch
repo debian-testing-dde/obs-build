@@ -1,0 +1,110 @@
+From: Andrej Shadura <andrew.shadura@collabora.co.uk>
+Date: Thu, 10 Nov 2022 16:23:50 +0100
+Subject: Wrap chroot + su in a function to consistently set up environment for builds
+
+Since "su -" cleans the environment, we need to tell it to keep
+variables we want to preserve. To make this easier, create a new wrapper
+su_deb_chroot that runs chroot and su and sets up the environment.
+
+Since DEBIAN_* variables are only needed when preparing the build
+chroot, don’t set them in su_deb_chroot.
+
+Signed-off-by: Andrej Shadura <andrew.shadura@collabora.co.uk>
+---
+ build-pkg-deb    | 19 +++++++++++++++++++
+ build-recipe-dsc | 20 ++++++++++----------
+ 2 files changed, 29 insertions(+), 10 deletions(-)
+
+diff --git a/build-pkg-deb b/build-pkg-deb
+index 8bca1a6..b4deceb 100644
+--- a/build-pkg-deb
++++ b/build-pkg-deb
+@@ -43,6 +43,25 @@ deb_chroot ()
+     )
+ }
+ 
++#
++# A wrapper around chroot + su to set the environment correctly for
++# the build process
++#
++su_deb_chroot()
++{
++    dir="$1"
++    command="$2"
++    shift 2
++    (
++	cd "$dir" &&
++			   LC_ALL=C.UTF-8 LANGUAGE=C.UTF-8 LANG=C.UTF-8 \
++			   TZ=UTC \
++			   chroot "$dir" su - "$BUILD_USER" \
++			   -w "LC_ALL,LANGUAGE,LANG,TZ" \
++			   -c "$command" "$@" < /dev/null
++    )
++}
++
+ deb_setup() {
+     mkdir -p $BUILD_ROOT/var/lib/dpkg
+     mkdir -p $BUILD_ROOT/var/log
+diff --git a/build-recipe-dsc b/build-recipe-dsc
+index a37a3fb..c14dbd4 100644
+--- a/build-recipe-dsc
++++ b/build-recipe-dsc
+@@ -111,22 +111,22 @@ dsc_build() {
+ 
+     echo "==== Filesystems in build chroot ===="
+     echo
+-    deb_chroot "$buildroot" su -c "cat /proc/self/mountinfo" - "$BUILD_USER" < /dev/null || true
++    su_deb_chroot "$buildroot" "cat /proc/self/mountinfo" || true
+     echo
+ 
+     echo "==== User identity in build chroot ===="
+     echo
+-    deb_chroot "$buildroot" su -c "id" - "$BUILD_USER" < /dev/null || true
++    su_deb_chroot "$buildroot" "id" || true
+     echo
+ 
+     echo "==== Environment variables in build chroot ===="
+     echo
+-    deb_chroot "$buildroot" su -c "env | LC_ALL=C sort -u" - "$BUILD_USER" < /dev/null || true
++    su_deb_chroot "$buildroot" "env | LC_ALL=C sort -u" || true
+     echo
+ 
+     echo "==== Packages installed in build chroot ===="
+     echo
+-    deb_chroot "$buildroot" su -c "dpkg-query -W" - "$BUILD_USER" < /dev/null || true
++    su_deb_chroot "$buildroot" "dpkg-query -W" || true
+     echo
+ 
+     DSC_BUILD_OPTIONS=
+@@ -144,7 +144,7 @@ dsc_build() {
+ 	chmod +x $buildroot/$TOPDIR/SOURCES/build.script
+     fi
+ 
+-    deb_chroot $buildroot su -c "export DEB_BUILD_OPTIONS=${DSC_BUILD_OPTIONS} ; cd $TOPDIR/BUILD && $DSC_BUILD_CMD" - $BUILD_USER < /dev/null && BUILD_SUCCEEDED=true
++    su_deb_chroot $buildroot "export DEB_BUILD_OPTIONS=${DSC_BUILD_OPTIONS} ; cd $TOPDIR/BUILD && $DSC_BUILD_CMD" && BUILD_SUCCEEDED=true
+ 
+     for changes in "$buildroot/$TOPDIR"/*.changes ; do
+ 	echo
+@@ -168,17 +168,17 @@ dsc_build() {
+ 		(*.deb|*.ddeb|*.udeb)
+ 		    echo "==== $f ===="
+ 		    echo
+-		    deb_chroot "$buildroot" su -c "dpkg-deb --info $(printf '%q' "$TOPDIR/$f")" - "$BUILD_USER" < /dev/null || true
++		    su_deb_chroot "$buildroot" "dpkg-deb --info $(printf '%q' "$TOPDIR/$f")" || true
+ 		    echo
+-		    deb_chroot "$buildroot" su -c "dpkg-deb --contents $(printf '%q' "$TOPDIR/$f")" - "$BUILD_USER" < /dev/null || true
++		    su_deb_chroot "$buildroot" "dpkg-deb --contents $(printf '%q' "$TOPDIR/$f")" || true
+ 		    echo
+ 	    esac
+ 	done < <(sed -ne '/Files:/,$s/^ ................................ [0-9][0-9]* [^ ]* [^ ]* //p' "$changes")
+     done
+ 
+-    if test "$BUILD_SUCCEEDED" = true -a "$DO_CHECKS" != "false" && ( deb_chroot $buildroot su -c "which lintian > /dev/null" - $BUILD_USER < /dev/null ); then
+-	DEB_CHANGESFILE=${DEB_DSCFILE%.dsc}$OBS_DCH_RELEASE"_"$(deb_chroot $buildroot su -c 'dpkg-architecture -qDEB_BUILD_ARCH')".changes"
+-	deb_chroot $buildroot su -c "cd $TOPDIR && echo Running lintian && (set -x && lintian -i $TOPDIR/$DEB_CHANGESFILE)" - $BUILD_USER < /dev/null || BUILD_SUCCEEDED=false
++    if test "$BUILD_SUCCEEDED" = true -a "$DO_CHECKS" != "false" && ( chroot $buildroot su -c "which lintian > /dev/null" - $BUILD_USER < /dev/null ); then
++	DEB_CHANGESFILE=${DEB_DSCFILE%.dsc}$OBS_DCH_RELEASE"_"$(chroot $buildroot su -c 'dpkg-architecture -qDEB_BUILD_ARCH')".changes"
++	su_deb_chroot $buildroot "cd $TOPDIR && echo Running lintian && (set -x && lintian -i $TOPDIR/$DEB_CHANGESFILE)" || BUILD_SUCCEEDED=false
+     fi
+ }
+ 

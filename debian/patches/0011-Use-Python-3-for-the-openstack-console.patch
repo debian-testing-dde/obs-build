@@ -1,0 +1,21 @@
+From: Andrej Shadura <andrew.shadura@collabora.co.uk>
+Date: Thu, 6 Aug 2020 10:48:57 +0200
+Subject: Use Python 3 for the openstack console
+
+---
+ build-vm-openstack | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/build-vm-openstack b/build-vm-openstack
+index 19ddc4e..5090437 100644
+--- a/build-vm-openstack
++++ b/build-vm-openstack
+@@ -271,7 +271,7 @@ vm_startup_openstack() {
+         sleep 1
+     done
+ 
+-    if ! python $BUILD_DIR/openstack-console "${WS_URL}" ; then
++    if ! python3 $BUILD_DIR/openstack-console "${WS_URL}" ; then
+         $NOVACLIENT delete $OPENSTACK_BUILD_ID
+         cleanup_and_exit 3
+     else
