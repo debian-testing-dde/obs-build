@@ -67,18 +67,33 @@ recipe_prepare_dsc() {
 	for DEB_DSCFILE in $BUILD_ROOT/$DEB_SOURCEDIR/*.dsc ; do : ; done 
 	DEB_DSCFILE="${DEB_DSCFILE##*/}"
     fi
-    chroot $BUILD_ROOT su -c "dpkg-source -x $DEB_SOURCEDIR/$DEB_DSCFILE $TOPDIR/BUILD" - $BUILD_USER
+    deb_chroot $BUILD_ROOT su -c "dpkg-source -x $DEB_SOURCEDIR/$DEB_DSCFILE $TOPDIR/BUILD" - $BUILD_USER
 
     # Alternative to debtransform: apply OBS release number if tag OBS-DCH-RELEASE is set.
-    if test -z "$DEB_TRANSFORM" && grep -Eq '^OBS-DCH-RELEASE: 1' $BUILD_ROOT$TOPDIR/SOURCES/$RECIPEFILE; then
-        OBS_DCH_RELEASE="+$DEB_RELEASE"
-        chroot $BUILD_ROOT su -c /bin/sh <<EOF
+    if test -z "$DEB_TRANSFORM" -a -n "$DEB_RELEASE"; then
+	if grep -Eq '^OBS-DCH-RELEASE: 1' $BUILD_ROOT$TOPDIR/SOURCES/$RECIPEFILE; then
+	        OBS_DCH_RELEASE="+$DEB_RELEASE"
+	else
+	        OBS_DCH_RELEASE="$DEB_RELEASE"
+	fi
+        deb_chroot $BUILD_ROOT su -c /bin/sh <<EOF
 cd $TOPDIR/BUILD
 [ ! -f debian/changelog ] && exit 0
 # avoid devscripts dependency and mimic dch
 PACKAGE=\$(dpkg-parsechangelog 2> /dev/null | grep -E '^Source:'  | awk '{ print \$NF }')
 VERSION=\$(dpkg-parsechangelog 2> /dev/null | grep -E '^Version:' | awk '{ print \$NF }')
-sed -i "s/\${PACKAGE} (\${VERSION})/\${PACKAGE} (\${VERSION}$OBS_DCH_RELEASE)/" debian/changelog
+DISTRO=\$(dpkg-parsechangelog 2> /dev/null | grep -E '^Distribution:' | awk '{ print \$NF }')
+URGENCY=\$(dpkg-parsechangelog 2> /dev/null | grep -E '^Urgency:' | awk '{ print \$NF }')
+DATE=\$(dpkg-parsechangelog 2> /dev/null | grep -E '^Date:' | awk '{ \$1=""; print substr(\$0,2) }')
+
+echo "\${PACKAGE} (\${VERSION}${OBS_DCH_RELEASE}) \${DISTRO}; urgency=\${URGENCY}" > .changelog.tmp
+echo "" >> .changelog.tmp
+echo "  * OBS build ${OBS_DCH_RELEASE}" >> .changelog.tmp
+echo "" >> .changelog.tmp
+echo " -- OBS Build <obs@buildd>  \${DATE}" >> .changelog.tmp
+echo "" >> .changelog.tmp
+cat debian/changelog >> .changelog.tmp
+mv .changelog.tmp debian/changelog
 EOF
     fi
 
@@ -86,6 +101,33 @@ EOF
 
 dsc_build() {
     local buildroot=$1
+    local changes
+    local f
+
+    echo "==== Kernel ===="
+    echo
+    uname -a || true
+    echo
+
+    echo "==== Filesystems in build chroot ===="
+    echo
+    su_deb_chroot "$buildroot" "cat /proc/self/mountinfo" || true
+    echo
+
+    echo "==== User identity in build chroot ===="
+    echo
+    su_deb_chroot "$buildroot" "id" || true
+    echo
+
+    echo "==== Environment variables in build chroot ===="
+    echo
+    su_deb_chroot "$buildroot" "env | LC_ALL=C sort -u" || true
+    echo
+
+    echo "==== Packages installed in build chroot ===="
+    echo
+    su_deb_chroot "$buildroot" "dpkg-query -W" || true
+    echo
 
     DSC_BUILD_OPTIONS=
     if test -n "$BUILD_JOBS" ; then
@@ -95,17 +137,48 @@ dsc_build() {
     # this allows the build environment to be manipulated
     # and alternate build commands can be used
     DSC_BUILD_CMD="$(queryconfig --dist "$BUILD_DIST" --archpath "$BUILD_ARCH" --configdir "$CONFIG_DIR" substitute dsc:build_cmd)"
-    test -z "$DSC_BUILD_CMD" && DSC_BUILD_CMD="dpkg-buildpackage -us -uc"
+    test -z "$DSC_BUILD_CMD" && DSC_BUILD_CMD="dpkg-buildpackage -us -uc -b"
     if test -e $buildroot/$TOPDIR/SOURCES/build.script ; then
 	echo "Sourcing build.script to build - it should normally run 'dpkg-buildpackage -us -uc'"
 	DSC_BUILD_CMD="source $TOPDIR/SOURCES/build.script"
 	chmod +x $buildroot/$TOPDIR/SOURCES/build.script
     fi
 
-    chroot $buildroot su -c "export DEB_BUILD_OPTIONS=${DSC_BUILD_OPTIONS} ; cd $TOPDIR/BUILD && $DSC_BUILD_CMD" - $BUILD_USER < /dev/null && BUILD_SUCCEEDED=true
+    su_deb_chroot $buildroot "export DEB_BUILD_OPTIONS=${DSC_BUILD_OPTIONS} ; cd $TOPDIR/BUILD && $DSC_BUILD_CMD" && BUILD_SUCCEEDED=true
+
+    for changes in "$buildroot/$TOPDIR"/*.changes ; do
+	echo
+	echo "==== $(basename "$changes") ===="
+	echo
+	cat "$changes"
+	echo
+
+	while read f ; do
+	    case "$f" in
+		(*.buildinfo)
+		    echo "==== $f ===="
+		    echo
+		    cat "$buildroot/$TOPDIR/$f"
+		    echo
+	    esac
+	done < <(sed -ne '/Files:/,$s/^ ................................ [0-9][0-9]* [^ ]* [^ ]* //p' "$changes")
+
+	while read f ; do
+	    case "$f" in
+		(*.deb|*.ddeb|*.udeb)
+		    echo "==== $f ===="
+		    echo
+		    su_deb_chroot "$buildroot" "dpkg-deb --info $(printf '%q' "$TOPDIR/$f")" || true
+		    echo
+		    su_deb_chroot "$buildroot" "dpkg-deb --contents $(printf '%q' "$TOPDIR/$f")" || true
+		    echo
+	    esac
+	done < <(sed -ne '/Files:/,$s/^ ................................ [0-9][0-9]* [^ ]* [^ ]* //p' "$changes")
+    done
+
     if test "$BUILD_SUCCEEDED" = true -a "$DO_CHECKS" != "false" && ( chroot $buildroot su -c "which lintian > /dev/null" - $BUILD_USER < /dev/null ); then
 	DEB_CHANGESFILE=${DEB_DSCFILE%.dsc}$OBS_DCH_RELEASE"_"$(chroot $buildroot su -c 'dpkg-architecture -qDEB_BUILD_ARCH')".changes"
-	chroot $buildroot su -c "cd $TOPDIR && echo Running lintian && (set -x && lintian -i $TOPDIR/$DEB_CHANGESFILE)" - $BUILD_USER < /dev/null || BUILD_SUCCEEDED=false
+	su_deb_chroot $buildroot "cd $TOPDIR && echo Running lintian && (set -x && lintian -i $TOPDIR/$DEB_CHANGESFILE)" || BUILD_SUCCEEDED=false
     fi
 }
 
