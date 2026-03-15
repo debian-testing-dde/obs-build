@@ -1,0 +1,1649 @@
+#!/bin/bash
+# Script to build a package.  It uses init_buildsystem to setup a chroot
+# building tree.  This script needs a directory as parameter.  This directory
+# has to include sources and a recipe file.
+#
+# BUILD_ROOT        here the packages will be built
+#
+################################################################
+#
+# Copyright (c) 1995-2014 SUSE Linux Products GmbH
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License version 2 or 3 as
+# published by the Free Software Foundation.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program (see the file COPYING); if not, write to the
+# Free Software Foundation, Inc.,
+# 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA
+#
+################################################################
+
+# some VMs do not allow to specify the init process...
+if test "$0" = /sbin/init ; then
+    exec /.build/build "$@"
+fi
+
+BUILD_CONF=/etc/build.conf
+
+# ignore BUILD_DIR if we have a config
+test -e "$BUILD_CONF" && BUILD_DIR=/usr/lib/build
+
+test -z "$BUILD_DIR" -a -e /.build/build.data -a -z "$BUILD_IGNORE_2ND_STAGE" && BUILD_DIR=/.build
+test -z "$BUILD_DIR" && BUILD_DIR=/usr/lib/build
+test -z "$BUILD_ROOT" && BUILD_ROOT=/var/tmp/build-root
+test -z "$CONFIG_DIR" && CONFIG_DIR="$BUILD_DIR/configs"
+
+export BUILD_ARCH BUILD_HOST_ARCH BUILD_ROOT BUILD_RPMS BUILD_DIR BUILD_DEBUG
+export BUILD_DIST ABUILD_UID ABUILD_GID
+
+icecream=0
+definesnstuff=()
+repos=()
+old_packages=()
+
+# slurp in vm support
+. "$BUILD_DIR/build-vm"
+
+# slurp in recipe support
+. "$BUILD_DIR/build-recipe"
+
+# slurp in package binary support
+. "$BUILD_DIR/build-pkg"
+
+# slurp in validation support
+. "$BUILD_DIR/build-validate-params"
+
+# need to restore build root owner for non-root builds
+browner=
+
+# Default uid:gid for the build user
+ABUILD_UID=399
+ABUILD_GID=399
+
+BUILD_OPTIONS_PARSED=
+DO_INIT=true
+DO_INIT_TOPDIR=true
+DO_LINT=
+DO_CHECKS=true
+CLEAN_BUILD=
+REMOVE_CCACHE=
+GENBUILDREQS_CLEAN_BUILD=
+RECIPEFILES=()
+SRCDIR=
+BUILD_JOBS=
+BUILD_THREADS=
+ABUILD_TARGET=
+CREATE_BASELIBS=
+USEUSEDFORBUILD=
+LIST_STATE=
+
+RUNNING_IN_VM=
+RPMLIST=
+RELEASE=
+REASON=
+NOROOTFORBUILD=
+LOGFILE=
+KILL=
+DO_WIPE=
+SEND_SYSRQ=
+CHANGELOG=
+BUILD_DEBUG=
+INCARNATION=
+DISTURL=
+LINKSOURCES=
+OVERLAY=
+RSYNCSRC=
+RSYNCDEST=
+RSYNCDONE=
+SIGNDUMMY=
+DO_STATISTICS=
+RUN_SHELL=
+RUN_SHELL_CMD=
+CCACHE=
+PKG_CCACHE=
+DLNOSIGNATURE=
+BUILD_FLAVOR=
+OBS_PACKAGE=
+CACHE_DIR=/var/cache/build
+
+RECIPE_BUILD_START_TIME=
+CCACHE_SETUP_START_TIME=
+
+# This is for insserv
+export YAST_IS_RUNNING=instsys
+# https://github.com/systemd/systemd/blob/master/docs/ENVIRONMENT.md
+export SYSTEMD_OFFLINE=1
+
+unset LANGUAGE
+unset LANG
+export LC_ALL=POSIX
+umask 022
+
+echo_help () {
+    cat << EOT
+
+Some comments for build
+-----------------------
+
+With build you can create binary packages.  They will be built in a chroot
+system.  This chroot system will be setup automatically.  Normally you can
+simply call build with a spec file as parameter - nothing else has to be
+set.
+
+If you want to set the directory where the chroot system will be setup
+(at the moment it uses $BUILD_ROOT),
+simply set the the environment variable BUILD_ROOT.
+
+Example:
+
+  export BUILD_ROOT=/var/tmp/mybuildroot
+
+
+Normally build builds the complete package including src.rpm (rpmbuild -ba).
+If you want to let build only make the binary package, simply set
+
+   export BUILD_RPM_BUILD_STAGE=-bb
+
+(or -bc, -bp, -bi, ...  see "Maximum RPM" for more details [*]).
+
+When the build command succeeds, the rpm files can be found under
+$BUILD_ROOT/usr/src/packages/RPMS/
+
+
+Known Parameters:
+
+  --help      You already got it :)
+
+  --kill      Instead of starting a build kill the one currently
+              running.
+
+  --shell     Instead of starting a build start a root shell in
+              the build root.
+
+  --shell-cmd CMD
+              Run the command CMD instead of giving a root shell
+              --shell option is implicit set.
+
+  --sysrq $   Sends a single specifed char as sysrq to the running
+              kernel of the build.
+
+  --clean     Delete old build root before initializing it
+
+  --wipe      Completely removes build environment and exits.
+
+  --no-init   Skip initialization of build root and start with build
+              immediately.
+
+  --no-checks Do not run checks (postbuild and %check)
+
+  --logfile logfile
+              Capture build output to logfile. Defaults to
+              .build.log in the build root for non-VM builds.
+
+  --repo PATH_OR_URL
+	      Use package repository at PATH_OR_URL. Supported formats
+              are rpm-md, yast2, debian, and arch linux.
+	      Alternatively zypp://NAME specifies the zypp
+	      repository NAME. The repo must be refreshed with zypp
+	      so package meta data is available locally. With emtpy
+	      NAME all enabled repositories are used.
+
+  --rpms path1:path2:...
+              Specify path where to find the RPMs for the build system
+
+  --arch arch1:arch2:...
+              Specify what architectures to select from the RPMs
+
+  --verify    Run verify when initializing the build root
+
+  --extra-packs pack
+  -X pack
+              Also install package 'pack'
+
+  --root rootdir
+              Use 'rootdir' to setup chroot environment
+
+  --cachedir cachedir
+              Use 'cachedir' to cache remote repo's packages. The
+              default cache dir is /var/cache/build, every repo
+              given by --repo corresponds to a subdir named
+              as md5sum of its repo url, for example:
+                 /var/cache/build/3e8ea9b47808629414a0cebc33ea285e
+
+  --oldpackages oldpackagesdir
+              Define a directory with a former build
+
+  --baselibs  Create -32bit/-64bit/-x86 rpms for other architectures
+
+  --list-state
+              List rpms that would be used to create a fresh build root.
+              Does not create the build root or perform a build.
+
+  --dist dist
+              Distribution to use
+
+  --with X
+              Enable feature X for build
+
+  --without X
+              Disable feature X for build
+
+  --define 'X Y'
+              Define macro X with value Y
+
+  --release release
+              Override Release in spec file
+
+  --stage -bSTAGE
+              Set stage for rpmbuild. Defaults to -ba.
+
+  --target platform
+              Set target platform for rpmbuild
+
+  --jobs N    Use N parallel processes during build.
+              Sets %jobs and %_smp_mflags macros and
+              defines the number of CPUs to use for
+              VMs.
+
+  --threads N sets number of threads for VM
+
+  --ccache
+              Use ccache to speed up rebuilds
+
+  --pkg-ccache /path/to/ccache.tar.gz
+              path to archive of ccache directory content.
+              Its contents will be extracted to /.ccache
+
+  --icecream N
+              Use N parallel build jobs with icecream
+
+  --overlay OVERLAY
+              Copy overlay filesystem to buildroot after installing
+              all RPMs. This must be a valid directory.
+
+  --rsync-src RSYNCSRC
+              Copy overlay folder (RSYNCSRC) to a folder (RSYNCDEST)
+              inside the buildroot using rsync.
+              It will "%define RSYNCDONE 1" for handling %setup in your
+              specfile. E.g.:
+              %prep
+              %if 0%{?RSYNCDONE}
+              %setup -n aaa_base -T -D -b 5 -b 7
+              %else
+              %setup -n aaa_base -b 5 -b 7
+              %endif
+
+  --rsync-dest RSYNCDEST
+              Copy overlay folder (RSYNCSRC) to a folder (RSYNCDEST)
+              inside the buildroot using rsync.
+
+  --uid uid:gid
+              Specify the uid and gid to use for the abuild user.
+              This is useful if you are hacking in the buildroot.
+              This must be set to the same value if the buildroot is re-used.
+
+  --statistics
+              monitor used resources during build inside VM
+
+  --kvm
+              Use KVM to secure build process. Your hardware needs to support
+              virtualization
+
+  --xen
+              Use XEN to secure build process, you to run in a XEN Dom0 environment.
+
+  --lxc
+              Use Linux Containers to isolate the process. This may not be 100% safe.
+
+  --openstack 
+              Cloud build
+
+  --ec2 
+              Cloud build
+
+  --emulator 
+              Use any generic emulator to isolate the build process. You need to write
+              an emulator/emulator.sh script and put it next to the build script sources.
+
+  --emulator-script SCRIPT
+              specify another emulator instead of emulator.sh
+
+  --vm-type TYPE
+              Use virtual machine instead of chroot
+              TYPE is one of xen|kvm|uml|qemu|lxc|zvm|openstack|ec2|docker|pvm|nspawn
+
+  --vm-worker GUEST
+              GUEST is a z/VM build worker controlled by the controlling
+	      z/VM build machine. 
+
+  --vm-worker-nr N
+              Each worker in z/VM needs a uniq number. This is needed to 
+              calculate uniq device addresses for root and swap device.
+
+  --vm-region NAME
+              EC2 only: defines amazon control server
+
+  --vm-server NAME
+              openstack only: defines control server name
+
+  --vm-disk FILE
+              Use FILE as disk for virtual machine.
+              Defaults to \$BUILD_ROOT.img if unset
+
+  --vm-swap FILE
+              Use FILE as swap space for virtual machine. The swap space is
+              also used for retrieving packages from the VM so its size must
+              be sufficiently large
+
+  --vm-disk-size SIZEINMB
+  --vm-swap-size SIZEINMB
+  --vm-disk-filesystem TYPE
+              Defaults for automatic setup of VM root/swap files.
+              May get overruled by build config vmfstype build flag.
+
+  --vm-disk-filesystem-options OPTIONS
+              nodirindex: disable dir indexing on ext filesystems. Slower, but reproducible builds
+
+  --vm-memory SIZEINMB
+              Set amount of RAM for VMs
+
+  --vm-hugetlbfs HUGETLBFSPATH
+              Use hugetlb for memory management, path to mounted hugetlbfs.
+
+  --vm-kernel FILE
+  --vm-initrd FILE
+              Kernel and initrd to use for VM (kvm and qemu only)
+
+  --vm-user   USERNAME
+              User name to run qemu/kvm process
+
+  --vm-telnet PORT
+              Is forwarding PORT to a telnet session inside of the VM.
+              Specify also needed extra packages via -x parameter, usually:
+                 --vm-telnet 1234 -x telnet-server -x net-tools
+              And connect from the host via
+                 telnet 1234
+              NOTE: The telnet server gets started after all packages got installed.
+
+  --vm-net OPTION
+  --vm-netdev OPTION
+  --vm-device OPTION
+              KVM only: Attach kvm option
+              Available options are -net, -netdev, -device
+	      (This options in kvm can not guarantee reproducible builds)
+  --debug
+              Enable creation of a debuginfo package
+
+Remember to have fun!
+
+[*] Maximum RPM: http://www.rpm.org/max-rpm/
+EOT
+}
+
+usage () {
+    cleanup_and_exit 1 "Usage: `basename $0` [--no-init|--clean|--rpms path|--verify|--help] [dir-to-build|recipe-to-build]"
+}
+
+#
+#  cleanup_and_exit
+#  return values: 0 -> success, new packages built
+#                 1 -> error, build failed
+#                 2 -> successfull build, but no changes to former built packages
+#                 3 -> something wrong with build or the host, leads to a retry
+#                 4 -> something FATAL with build or the host, leads to a retry, but do not build on this host anymore
+#
+cleanup_and_exit () {
+    trap EXIT
+    test -z "$1" && set 0
+    if test -n "$2" ; then
+	if test "$1" -ne 0 ; then
+	    echo "$2" >&2
+	else
+	    echo "$2"
+	fi
+    fi
+    if test -z "$BUILD_OPTIONS_PARSED" ; then
+	# if we haven't parsed the options yet we do
+	# not know the correct build root. just exit.
+	exit $1
+    fi
+    rm -f $BUILD_ROOT/exit
+
+    # add build time statistics
+    recipe_build_time_statistics
+
+    # Never inside of VM
+    # but for chroot or the filesystem hosting the root file
+    if test -z "$RUNNING_IN_VM" ; then
+        # check for disk full for an automatic build retry
+        if test "$1" -eq 1 -a -x /bin/df ; then
+            echo
+            echo "$HOST failed \"build $RECIPEFILE\" at `date --utc`."
+            echo
+            # okay, it failed, but maybe because disk space?
+            if df $BUILD_ROOT 2>/dev/null | grep -q "100%"; then
+                df $BUILD_ROOT 2>/dev/null
+                echo
+                echo "$HOST ran out of disk space. Please try again."
+                echo
+                set 3
+            fi
+        fi
+    fi
+ 
+    if test -z "$VM_TYPE" -o -n "$RUNNING_IN_VM" ; then
+        # run recipe cleanup code
+	test -n "$BUILDTYPE" && recipe_cleanup
+    fi
+
+    # shutdown
+    if test -n "$RUNNING_IN_VM" ; then
+	echo "$1" >  /.build/_exitcode
+	test -n "$browner" && chown "$browner" $BUILD_ROOT
+	vm_shutdown "$1"
+    else
+	buildroot_umount /proc/sys/fs/binfmt_misc
+	buildroot_umount /proc
+	buildroot_umount /sys
+	buildroot_umount /dev/pts
+	buildroot_umount /dev/shm
+	test -n "$VM_ROOT" -a "$VM_ROOT" != 1 && umount $BUILD_ROOT 2>/dev/null || true
+	test -n "$VM_TYPE" && vm_cleanup
+    fi
+    exit $1
+}
+
+fail_exit() {
+    cleanup_and_exit 1
+}
+
+shellquote() {
+    for arg ; do
+	arg=${arg/\\/\\\\}
+	arg=${arg/\$/\\\$}
+	arg=${arg/\"/\\\"}
+	arg=${arg/\`/\\\`}
+	echo -n " \"$arg\""
+    done
+}
+
+# create a shell script from command line. Used for preserving arguments
+# through /bin/su -c
+toshellscript() {
+    echo "#!/bin/sh -x"
+    echo -n exec
+    shellquote "$@"
+    echo
+}
+
+setupccache() {
+    if test -n "$CCACHE" ; then
+        CCACHE_SETUP_START_TIME=`date +%s`
+	if mkdir -p $BUILD_ROOT/var/lib/build/ccache/bin; then
+	    for i in $(ls $BUILD_ROOT/usr/bin | grep -E '^(cc|gcc|[cg][+][+]|clang|clang[+][+])([-]?[.0-9])*$'); do
+		rm -f $BUILD_ROOT/var/lib/build/ccache/bin/$i
+		test -e $BUILD_ROOT/usr/bin/$i || continue
+		echo '#! /bin/sh' > $BUILD_ROOT/var/lib/build/ccache/bin/$i
+		echo "test -e /usr/bin/$i || exit 1" >> $BUILD_ROOT/var/lib/build/ccache/bin/$i
+		echo 'export PATH=/usr/lib/icecc/bin:/opt/icecream/bin:/usr/bin:$PATH' >> $BUILD_ROOT/var/lib/build/ccache/bin/$i
+		echo "ccache $i \"\$@\"" >> $BUILD_ROOT/var/lib/build/ccache/bin/$i
+		chmod 755 $BUILD_ROOT/var/lib/build/ccache/bin/$i
+		echo "Installed ccache wrapper as $BUILD_ROOT/var/lib/build/ccache/bin/$i"
+	    done
+	fi
+	mkdir -p "$BUILD_ROOT/.ccache"
+	echo 'export PATH=/var/lib/build/ccache/bin:$PATH' >> "$BUILD_ROOT"/etc/profile.d/build_ccache.sh
+
+        local cconf="$BUILD_ROOT"/etc/ccache.conf
+        if test -e $cconf; then
+            grep -q "^compression*" $cconf && sed -i "s:compression.*:compression = true:g" $cconf || echo "compression = true"   >> $cconf
+            grep -q "^cache_dir*"   $cconf && sed -i "s:cache_dir.*:cache_dir = /.ccache:g" $cconf || echo "cache_dir = /.ccache" >> $cconf
+        else
+            echo "compression = true"    >> $cconf
+            echo "cache_dir = /.ccache" >> $cconf
+        fi
+        local ccachetar="$BUILD_ROOT/.build.oldpackages/_ccache.tar"
+        test -e $ccachetar && tar -xf $ccachetar -C "$BUILD_ROOT/.ccache/"
+        rm -f $ccachetar
+        chown -R "$ABUILD_UID:$ABUILD_GID" "$BUILD_ROOT/.ccache"
+    else
+        CCACHE_SETUP_START_TIME=
+	rm -f "$BUILD_ROOT"/var/lib/build/ccache/bin/{gcc,g++,cc,c++,clang,clang++}
+    fi
+}
+
+setupicecream() {
+    local icecreamdir=/var/run/icecream
+    if test "$(readlink "$BUILD_ROOT/var/run")" = /run ; then
+	icecreamdir=/run/icecream
+    fi
+    if test "$icecream" -eq 0 ; then
+	rm -rf "$BUILD_ROOT$icecreamdir"
+	rm -f "$BUILD_ROOT/etc/profile.d/build_icecream.sh"
+	return 0
+    fi
+
+    if ! chroot "$BUILD_ROOT" rpm -q icecream >/dev/null 2>/dev/null; then
+	echo "*** icecream package not installed ***"
+	return 1
+    fi
+
+    echo "using icecream with $icecream jobs"
+
+    if test -z "$CCACHE" ; then
+	echo 'export PATH=/usr/lib/icecc/bin:/opt/icecream/bin:$PATH' > "$BUILD_ROOT"/etc/profile.d/build_icecream.sh
+    else
+	echo 'export CCACHE_PATH=/usr/lib/icecc/bin:/opt/icecream/bin' > "$BUILD_ROOT"/etc/profile.d/build_icecream.sh
+    fi
+
+    local icecc_vers=(`shopt -s nullglob; echo $BUILD_ROOT$icecreamdir/*.tar.{bz2,gz}`)
+    icecc_vers=${icecc_vers//$BUILD_ROOT/}
+
+    # XXX use changelog like autobuild does instead?
+    # only run create-env if compiler or glibc changed
+    if test -z "$icecc_vers" \
+	-o ! -e "$BUILD_ROOT/$icecc_vers" \
+	-o "$BUILD_ROOT/usr/bin/gcc" -nt "$BUILD_ROOT/$icecc_vers" \
+	-o "$BUILD_ROOT/usr/bin/g++" -nt "$BUILD_ROOT/$icecc_vers" \
+	-o "$BUILD_ROOT/usr/bin/as" -nt "$BUILD_ROOT/$icecc_vers" \
+	-o "$BUILD_ROOT/lib/libc.so.6" -nt "$BUILD_ROOT/$icecc_vers"
+    then
+	rm -rf "$BUILD_ROOT$icecreamdir"
+	mkdir -p "$BUILD_ROOT$icecreamdir"
+	if test -e "$BUILD_ROOT"/usr/bin/create-env ; then
+	    createenv=/usr/bin/create-env
+	elif test -e "$BUILD_ROOT"/usr/lib/icecc/icecc-create-env ; then
+	    createenv="/usr/lib/icecc/icecc-create-env /usr/bin/gcc /usr/bin/g++" # XXX
+	elif test -e "$BUILD_ROOT"/usr/lib64/icecc/icecc-create-env ; then
+	    createenv="/usr/lib64/icecc/icecc-create-env /usr/bin/gcc /usr/bin/g++" # XXX
+	else
+	    echo "create-env not found"
+	    return 1
+	fi
+        echo "creating new env in '$icecreamdir'"
+	chroot $BUILD_ROOT bash -c "cd $icecreamdir; $createenv" || cleanup_and_exit 1
+	icecc_vers=(`shopt -s nullglob; echo $BUILD_ROOT/$icecreamdir/*.tar.{bz2,gz}`)
+	icecc_vers=${icecc_vers//$BUILD_ROOT/}
+	echo "created icecream environment $icecc_vers"
+    else
+	echo "reusing existing icecream environment $icecc_vers"
+    fi
+    if test -n "$icecc_vers" ; then
+	echo "export ICECC_VERSION=$icecc_vers" >> "$BUILD_ROOT"/etc/profile.d/build_icecream.sh
+    fi
+}
+
+setmemorylimit() {
+    if test -n "$VM_ROOT" -o -n "$RUNNING_IN_VM" ; then
+	return
+    fi
+    local mem
+    local limit
+    while read mem; do
+	case "$mem" in
+	    MemTotal:*)
+		set -- $mem
+		eval "limit=\$(($2/3*2))"
+	    ;;
+	    SwapTotal:*)
+		set -- $mem
+		eval "limit=\$(($2/3*2+$limit))"
+	    ;;
+	esac
+    done < <(cat /proc/meminfo) # cat for proc stuff
+
+    ulimit -v $limit
+    echo "Memory limit set to ${limit}KB"
+}
+
+create_baselibs() {
+    local pkgs=()
+    local line
+
+    BASELIBS_CFG=
+
+    if test "$BUILDTYPE" == arch || test "$BUILDTYPE" = collax ; then
+	return
+    fi
+    if test "$BUILDTYPE" == dsc ; then
+	pkgs=($DEBS)
+    else # spec and kiwi
+	if test -e $BUILD_ROOT$TOPDIR/SOURCES/baselibs.conf ; then
+	    BASELIBS_CFG="-c $TOPDIR/SOURCES/baselibs.conf"
+	fi
+	if test -e $BUILD_ROOT/usr/lib/build/baselibs_global.conf; then
+	    BASELIBS_GLOBAL="-c /usr/lib/build/baselibs_global.conf"
+	fi
+	pkgs=($RPMS)
+    fi
+
+    # don't use -R as extracted sources, build root etc might be below $TOPDIR
+    chown "$ABUILD_UID:$ABUILD_GID" "$BUILD_ROOT$TOPDIR"/* "$BUILD_ROOT$TOPDIR"/RPMS/* || true
+
+    local mkbaselibs="/usr/lib/build/mkbaselibs"
+    local whichone=''
+    # $BUILD_DIR is set to /.build when using a vm. So we need to
+    # hardcode /usr/lib/build instead of $BUILD_DIR to prefer
+    # mkbaselibs from the distro.
+    if test -f $BUILD_ROOT$mkbaselibs; then
+	if test -z "$BASELIBS_CFG" -a -e $BUILD_ROOT/usr/lib/build/baselibs.conf ; then
+	    BASELIBS_CFG="-c /usr/lib/build/baselibs.conf"
+	fi
+    else
+	if test "$CREATE_BASELIBS" = 'internal'; then
+	    echo "Warning: mkbaselibs missing in build root, skipping baselibs"
+	    return
+	fi
+	# use external version
+	whichone=" (external)"
+	mkbaselibs="/.mkbaselibs/mkbaselibs"
+	rm -rf "$BUILD_ROOT/.mkbaselibs"
+	mkdir -p "$BUILD_ROOT/.mkbaselibs"
+	cp -f $BUILD_DIR/mkbaselibs $BUILD_ROOT/.mkbaselibs/
+	if test "$BUILDTYPE" == "dsc" ; then
+	    cp -f $BUILD_DIR/baselibs_global-deb.conf $BUILD_ROOT/.mkbaselibs/baselibs_g.conf
+	    cp -f $BUILD_ROOT$TOPDIR/SOURCES/baselibs-deb.conf $BUILD_ROOT/.mkbaselibs/baselibs-deb.conf
+	    BASELIBS_CFG="-c /.mkbaselibs/baselibs-deb.conf"
+	else
+	    cp -f $BUILD_DIR/baselibs_global.conf $BUILD_ROOT/.mkbaselibs/baselibs_g.conf
+	    if test -z "$BASELIBS_CFG" -a -e $BUILD_DIR/baselibs.conf; then
+		cp -f $BUILD_DIR/baselibs.conf $BUILD_ROOT/.mkbaselibs/baselibs.conf
+		BASELIBS_CFG="-c /.mkbaselibs/baselibs.conf"
+	    fi
+	fi
+	if test -e $BUILD_ROOT/.mkbaselibs/baselibs_g.conf; then
+	    BASELIBS_GLOBAL="-c /.mkbaselibs/baselibs_g.conf"
+	fi
+    fi
+    echo "... creating baselibs$whichone"
+    while read line
+    do
+	chroot $BUILD_ROOT su -c "$mkbaselibs $BASELIBS_GLOBAL $BASELIBS_CFG $line" - $BUILD_USER || cleanup_and_exit 1
+    done < <(IFS=$'\n'; echo "${pkgs[*]#$BUILD_ROOT}" | xargs -n 1024)
+    rm -rf "$BUILD_ROOT/.mkbaselibs"
+}
+
+copy_oldpackages() {
+    local i=0
+    local d
+    local dest
+    test -z "$RUNNING_IN_VM" || return 0
+    if test -z "$old_packages" ; then
+	rm -rf "$BUILD_ROOT"/.build.oldpackages*
+	return 0
+    fi
+    for d in "${old_packages[@]}"; do
+	dest="$BUILD_ROOT/.build.oldpackages"
+	test "$i" = 0 || dest="$dest$i"
+	if test -d "$d" -a "$d" != "$dest" ; then
+	    rm -rf "$dest"
+	    mkdir -p "$dest"
+	    cp -L $d/* "$dest"
+	    : $((++i))
+	fi
+    done
+}
+
+mkdir_build_root() {
+    # strip trailing slash
+    test "$BUILD_ROOT" != / && BUILD_ROOT="${BUILD_ROOT%/}"
+    if test -d "$BUILD_ROOT" ; then
+	# check if it is owned by root
+	if test -z "$RUNNING_IN_VM" -a \! -O "$BUILD_ROOT" -a "`stat -c %u $BUILD_ROOT`" -ne 0 ; then
+	    cleanup_and_exit 1 "BUILD_ROOT=$BUILD_ROOT must be owned by root. Exit..."
+	fi
+    else
+	test "$BUILD_ROOT" != "${BUILD_ROOT%/*}" && mkdir -p "${BUILD_ROOT%/*}"
+	if ! mkdir $BUILD_ROOT ; then
+	    cleanup_and_exit 1 "can not create BUILD_ROOT=$BUILD_ROOT. Exit..."
+	fi
+    fi
+
+    if test ! -w "$BUILD_ROOT" ; then
+	cleanup_and_exit 4 "Error: BUILD_ROOT=$BUILD_ROOT not writeable, try --clean."
+    fi
+
+    rm -rf "$BUILD_ROOT/.build.packages"
+    if test -z "$VM_TYPE" -a -z "$RUNNING_IN_VM" ; then
+         # don't touch this in VM
+         rm -rf "$BUILD_ROOT/.build"
+         mkdir -p "$BUILD_ROOT/.build"
+    fi
+}
+
+copy_overlay() {
+    if test -d "$OVERLAY"; then
+	pushd $OVERLAY
+	echo "Copying overlay to BUILD_ROOT"
+	tar -cpf - . | (cd $BUILD_ROOT ; tar -xvf -)
+	popd
+    else
+	echo "OVERLAY ($OVERLAY) is no directory - skipping"
+    fi
+}
+
+run_rsync() {
+    if test -n "$RSYNCDEST" ; then
+	if test -d "$RSYNCSRC" ; then
+	    if ! test -d "$BUILD_ROOT/$RSYNCDEST" ; then
+		echo "ATTENTION! Creating missing target directory ($BUILD_ROOT/$RSYNCDEST)."
+		mkdir -p $BUILD_ROOT/$RSYNCDEST
+	    fi
+	    echo "Running rsync ..."
+	    rsync -av $RSYNCSRC/* $BUILD_ROOT/$RSYNCDEST/
+	    chown -R "$ABUILD_UID:$ABUILD_GID" "$BUILD_ROOT/$RSYNCDEST"
+	    RSYNCDONE=true
+	    echo "... done"
+	else
+	    echo "RSYNCSRC is not a directory - skipping"
+	fi
+    else
+	echo "RSYNCSRC given, but not RSYNCDEST - skipping"
+    fi
+}
+
+wipe_build_environment() {
+    if test -n "$VM_TYPE" ; then
+	vm_img_wipe
+    else
+	echo "Wiping build root: '$BUILD_ROOT'"
+
+	# unmount all mounts still in the build root path
+	for m in $(cat /proc/mounts | grep "$BUILD_ROOT" | awk '{ print $2 }'); do
+	    if ! umount -n "$m" 2>/dev/null ; then
+		echo "Failed to umount "$m", cannot wipe buildroot"
+		exit 1
+	    fi
+	done
+	rm -rf "$BUILD_ROOT"
+    fi  
+}
+
+sysrq_running_build() {
+    test -z "$SRCDIR" || usage
+    if test -n "$VM_TYPE" ; then
+	vm_sysrq "$1"
+    else
+	cleanup_and_exit 1 "can not send a sysrq to chroot builds"
+    fi
+}
+
+kill_running_build() {
+    test -z "$SRCDIR" || usage
+    (set -C; > "$BUILD_ROOT/exit" 2>/dev/null || true)
+    if test -n "$VM_TYPE" ; then
+	# mark job as failed so that we don't extract packages
+	vm_set_buildstatus 1
+	vm_kill
+    else
+	if ! $BUILD_DIR/killchroot -s 9 $BUILD_ROOT ; then
+	    cleanup_and_exit 1 "could not kill build in $BUILD_ROOT"
+	fi
+    fi
+}
+
+mount_stuff() {
+    if test -n "$BUILD_ROOT" -a "$BUILD_ROOT" != / ; then
+	test -d $BUILD_ROOT/dev/shm || rm -f $BUILD_ROOT/dev/shm
+	mkdir -p $BUILD_ROOT/proc
+	mkdir -p $BUILD_ROOT/sys
+	mkdir -p $BUILD_ROOT/dev/pts
+	mkdir -p $BUILD_ROOT/dev/shm
+	mount -n -tproc none $BUILD_ROOT/proc
+	mount -n -tsysfs none $BUILD_ROOT/sys
+	mount -n -tdevpts -omode=0620,gid=5 none $BUILD_ROOT/dev/pts
+	mount -n -ttmpfs none $BUILD_ROOT/dev/shm
+    fi
+}
+
+umount_stuff() {
+    if test -n "$BUILD_ROOT" -a "$BUILD_ROOT" != / ; then
+	buildroot_umount /proc/sys/fs/binfmt_misc
+	buildroot_umount /proc
+	buildroot_umount /sys
+	buildroot_umount /dev/pts
+	buildroot_umount /dev/shm
+    fi
+}
+
+#### main ####
+
+trap fail_exit EXIT
+
+shopt -s nullglob
+
+export PATH=$BUILD_DIR:/sbin:/usr/sbin:/bin:/usr/bin:$PATH
+
+if vm_detect_2nd_stage ; then
+    set "/.build-srcdir/$RECIPEFILE"
+    export PATH=/.build:$PATH
+fi
+
+. $BUILD_DIR/common_functions || exit 1
+
+export HOST
+
+needarg() {
+    if test -z "$ARG" ; then
+	cleanup_and_exit 1 "$PARAM needs an agrument"
+    fi
+}
+
+validate_init "$BUILD_CONF"
+
+while test -n "$1"; do
+    PARAM="$1"
+    ARG="$2"
+    test "$ARG" = "${ARG#-}" || ARG=
+    shift
+    case $PARAM in
+      *-*=*)
+	ARG=${PARAM#*=}
+	PARAM=${PARAM%%=*}
+	set -- "----noarg=$PARAM" "$@"
+	;;
+    esac
+    case ${PARAM/#--/-} in
+      -help|-h)
+	echo_help
+	cleanup_and_exit
+      ;;
+      -noinit|-no-init)
+	test "$DO_INIT" = false && DO_INIT_TOPDIR=false
+	DO_INIT=false
+      ;;
+      -nochecks|-no-checks)
+	DO_CHECKS=false
+      ;;
+      -clean)
+	test "$CLEAN_BUILD" = '--clean' && GENBUILDREQS_CLEAN_BUILD='--clean'
+	CLEAN_BUILD='--clean'
+	REMOVE_CCACHE="$CLEAN_BUILD"
+      ;;
+      -wipe)
+	DO_WIPE=true
+      ;;
+      -kill)
+	KILL=true
+      ;;
+      -rpms)
+	needarg
+	BUILD_RPMS="$ARG"
+	shift
+      ;;
+      -arch)
+	needarg
+	BUILD_ARCH="$ARG"
+	shift
+      ;;
+      -hostarch|-host-arch)
+	needarg
+	BUILD_HOST_ARCH="$ARG"
+	shift
+      ;;
+      -verify)
+	export VERIFY_BUILD_SYSTEM=true
+      ;;
+      -target)
+	needarg
+	ABUILD_TARGET="$ARG"
+	shift
+      ;;
+      -jobs)
+	needarg
+	BUILD_JOBS="$ARG"
+	shift
+      ;;
+      -threads)
+	needarg
+	BUILD_THREADS="$ARG"
+	shift
+      ;;
+      -extrapacks|-extra-packs|-X)
+	needarg
+	BUILD_EXTRA_PACKS="$BUILD_EXTRA_PACKS $ARG"
+	shift
+      ;;
+      -lint)
+        # OBSOLETE: just keeping it for compability
+	DO_LINT=true
+	;;
+      -baselibs)
+	CREATE_BASELIBS=true
+	;;
+      -baselibs-internal)
+	CREATE_BASELIBS=internal
+	;;
+      -root)
+	needarg
+	BUILD_ROOT="$ARG"
+	shift
+      ;;
+      -cachedir)
+	needarg
+	CACHE_DIR="$ARG"
+	shift
+      ;;
+      -oldpackages)
+	needarg
+	old_packages=("${old_packages[@]}" "$ARG")
+	shift
+      ;;
+      -dist)
+	needarg
+	BUILD_DIST="$ARG"
+	shift
+      ;;
+      -release)
+	needarg
+	RELEASE="$ARG"
+	shift
+      ;;
+      -logfile)
+	needarg
+	LOGFILE="$ARG"
+	shift
+      ;;
+      -reason)
+	needarg
+	REASON="$ARG"
+	shift
+      ;;
+      -norootforbuild)
+	NOROOTFORBUILD=true
+      ;;
+      -useusedforbuild)
+	USEUSEDFORBUILD="--useusedforbuild"
+      ;;
+      -configdir)
+        needarg
+	CONFIG_DIR="$ARG"
+        shift
+      ;;
+      -list*state)
+	LIST_STATE=true
+      ;;
+      -define|-with|-without)
+	needarg
+        PARAM="-${PARAM/#--/-}"
+	definesnstuff[${#definesnstuff[@]}]="$PARAM"
+	definesnstuff[${#definesnstuff[@]}]="$ARG"
+	shift
+      ;;
+      -repository|-repo)
+	needarg
+	repos[${#repos[@]}]="--repository"
+	repos[${#repos[@]}]="$ARG"
+	shift
+      ;;
+      -icecream)
+	needarg
+	icecream="$ARG"
+	test "$icecream" -gt 0 && BUILD_JOBS="$ARG"
+	shift
+      ;;
+      -ccache) # this is initialized after all the parsing is done
+	CCACHE=true
+      ;;
+      -pkg-ccache)
+	needarg
+	PKG_CCACHE="$ARG"
+	shift
+	CCACHE=true
+      ;;
+      -statistics)
+	DO_STATISTICS=1
+      ;;
+      -debug)
+	BUILD_DEBUG=1
+      ;;
+      -incarnation)
+	needarg
+	INCARNATION=$ARG
+	shift
+      ;;
+      -disturl)
+	needarg
+	DISTURL=$ARG
+	shift
+      ;;
+      -linksources)
+	LINKSOURCES=true
+      ;;
+      -changelog)
+	CHANGELOG=true
+      ;;
+      -overlay)
+	needarg
+	OVERLAY=$ARG
+	shift
+      ;;
+      -rsync-src)
+	needarg
+	RSYNCSRC=$ARG
+	shift
+      ;;
+      -rsync-dest)
+	needarg
+	RSYNCDEST=$ARG
+	shift
+      ;;
+      -uid)
+	needarg
+	if test -n "${ARG//[0-9:]/}" ; then
+	    cleanup_and_exit 1 "--uid argument must be uid:gid"
+	fi
+	ABUILD_UID=${ARG%:*}
+	ABUILD_GID=${ARG#*:}
+	shift
+      ;;
+      -rpmlist)
+	needarg
+	RPMLIST="--rpmlist $ARG"
+	BUILD_RPMS=
+	shift
+      ;;  
+      -sysrq)
+	needarg
+	SEND_SYSRQ="${ARG:0:1}"
+	shift
+      ;;  
+      -shell)
+	RUN_SHELL=1
+      ;;
+      -shell-cmd)
+	needarg
+	RUN_SHELL=1
+	RUN_SHELL_CMD="$ARG"
+	shift
+      ;;
+      -signdummy)
+	SIGNDUMMY=1
+      ;;
+      -nosignature)
+	DLNOSIGNATURE="--nosignature"
+      ;;
+      -obsmultibuild|-obs-multibuild|-buildflavor|-build-flavor)
+	needarg
+	BUILD_FLAVOR=$ARG
+	shift
+      ;;
+      -obspackage|-obs-package)
+	needarg
+	OBS_PACKAGE=$ARG
+	shift
+      ;;
+      ---noarg)
+	cleanup_and_exit 1 "$ARG does not take an argument"
+      ;;
+      -*)
+	if vm_parse_options "$@" ; then
+	    set -- "${nextargs[@]}"
+	elif recipe_parse_options "$@" ; then
+	    set -- "${nextargs[@]}"
+	else
+	    cleanup_and_exit 1 "Unknown option '$PARAM'. Exit."
+	fi
+      ;;
+      *)
+	RECIPEFILES[${#RECIPEFILES[@]}]="$PARAM"
+	# skip validation
+	PARAM=
+      ;;
+    esac
+    if test -n "$PARAM" ; then
+	validate_param "$PARAM" "$ARG"
+    fi
+done
+
+# validate params coming from the environment
+test -n "$BUILD_ARCH" && validate_param "--arch" "$BUILD_ARCH" BUILD_ARCH
+test -n "$BUILD_HOST_ARCH" && validate_param "--hostarch" "$BUILD_HOST_ARCH" BUILD_HOST_ARCH
+test -n "$BUILD_RPMS" && validate_param "--rpms" "$BUILD_RPMS" BUILD_RPMS
+test -n "$BUILD_EXTRA_PACKS" && validate_param "--extrapacks" "$BUILD_EXTRA_PACKS" BUILD_EXTRA_PACKS
+test -n "$BUILD_DIST" && validate_param "--dist" "$BUILD_DIST" BUILD_DIST
+test -n "$VERIFY_BUILD_SYSTEM" && validate_param "--verify" "$VERIFY_BUILD_SYSTEM" VERIFY_BUILD_SYSTEM
+test -n "$BUILD_RPM_BUILD_STAGE" && validate_param "--stage" "$BUILD_RPM_BUILD_STAGE" BUILD_RPM_BUILD_STAGE
+test "$BUILD_ROOT" != /var/tmp/build-root && validate_param "--root" "$BUILD_ROOT" BUILD_ROOT
+test "$CONFIG_DIR" != "$BUILD_DIR/configs" && validate_param "--configdir" "$CONFIG_DIR" CONFIG_DIR
+
+# validate the buildroot
+validate_buildroot "$BUILD_ROOT"
+
+# done option parsing
+BUILD_OPTIONS_PARSED=true
+
+
+if test -n "$VM_TYPE" -a -z "$RUNNING_IN_VM" ; then
+    vm_verify_options
+    vm_set_defaults
+fi
+
+initbuildsysstuff=()
+if test -n "$BUILD_FLAVOR" ; then
+    initbuildsysstuff[${#initbuildsysstuff[@]}]="--buildflavor"
+    initbuildsysstuff[${#initbuildsysstuff[@]}]="$BUILD_FLAVOR"
+fi
+if test -n "$OBS_PACKAGE" ; then
+    initbuildsysstuff[${#initbuildsysstuff[@]}]="--obspackage"
+    initbuildsysstuff[${#initbuildsysstuff[@]}]="$OBS_PACKAGE"
+fi
+
+if test -n "$DO_WIPE" ; then
+    wipe_build_environment
+    cleanup_and_exit
+fi
+
+if test -n "$KILL" ; then
+    kill_running_build
+    cleanup_and_exit
+fi
+
+if test -n "$SEND_SYSRQ" ; then
+    sysrq_running_build "$SEND_SYSRQ"
+    cleanup_and_exit
+fi
+
+if test -n "$CLEAN_BUILD" ; then
+    DO_INIT=true
+    DO_INIT_TOPDIR=true
+fi
+
+if test -z "$RPMLIST" -a -z "$RUNNING_IN_VM" ; then
+    if test -z "$repos" -a -z "$BUILD_RPMS" ; then
+	repos=(--repository 'zypp://')
+    fi
+else
+    repos=()
+fi
+
+set_build_arch
+
+if test "$DO_INIT" = false -a -n "$RUN_SHELL"; then
+    mount_stuff
+    BUILD_USER=root
+    test -n "$NOROOTFORBUILD" && BUILD_USER=abuild
+    chroot $BUILD_ROOT su - $BUILD_USER
+    cleanup_and_exit $?
+fi
+
+expand_recipe_directories
+
+if test -n "$LIST_STATE" ; then
+    BUILD_ROOT=`mktemp -d /var/tmp/build-list-state-XXXXXX`
+    test -d "$BUILD_ROOT" || cleanup_and_exit 3
+    RECIPEFILE=$RECIPEFILES # only one specified anyways
+    if test "$RECIPEFILE" != "${RECIPEFILE%.src.rpm}" ; then
+	MYSRCDIR="$BUILD_ROOT/usr/src/packages/SOURCES"
+	recipe_unpack_srcrpm
+	RECIPEFILE="$MYSRCDIR/$RECIPEFILE"
+    fi
+    init_buildsystem --configdir "$CONFIG_DIR" --cachedir "$CACHE_DIR" --list-state "${initbuildsysstuff[@]}" "${definesnstuff[@]}" "${repos[@]}" $DLNOSIGNATURE $USEUSEDFORBUILD $RECIPEFILE $BUILD_EXTRA_PACKS
+    ERR=$?
+    rm -rf "$BUILD_ROOT"
+    cleanup_and_exit $ERR
+fi
+
+# do vm setup if needed
+if test -z "$RUNNING_IN_VM" -a -n "$VM_TYPE" -a -n "$VM_ROOT" ; then
+    vm_setup
+fi
+
+mkdir_build_root
+
+if test "$BUILD_ROOT" = / ; then
+    browner="$(stat -c %u /)"
+fi
+
+rm -f $BUILD_ROOT/exit
+
+if test -z "$VM_ROOT" -a -z "$LOGFILE" ; then
+    if test -z "$RUNNING_IN_VM"; then
+        LOGFILE="$BUILD_ROOT/.build.log"
+    else
+        # lxc, docker and nspawn are special cases: vm shares logfile with host
+        case "$VM_TYPE" in
+        lxc|docker|nspawn)
+            ;;
+        *)
+            LOGFILE="$BUILD_ROOT/.build.log"
+            ;;
+        esac
+    fi
+fi
+
+if test -n "$LOGFILE" -a -z "$RUN_SHELL" ; then
+    echo "logging output to $LOGFILE..."
+    rm -f $LOGFILE
+    touch $LOGFILE
+    # set start time, to be substracted for build log timestamps
+    STARTTIME=`perl -e 'print time()'`
+
+    if test -n "$RUNNING_IN_VM" ; then
+        # no additional timestamps in inner vm build system
+	exec 1> >(exec -a 'build logging' tee -a $LOGFILE) 2>&1
+    elif test -n "$VM_ROOT" ; then
+        # external run of virtualization build
+	exec 1> >(exec -a 'build logging' perl -e 'open(F,">>",$ARGV[0])||die("$ARGV[0]: $!\n");$|=1;select(F);$|=1;while(<STDIN>){my $p=sprintf("[%5ds] ", time()-'$STARTTIME');print STDOUT $p.$_;s/^\r//s;s/\r\n/\n/gs;print F $p.$_}' $LOGFILE) 2>&1
+    else
+        # plain chroot
+	exec 1> >(exec -a 'build logging' perl -e 'open(F,">>",$ARGV[0])||die("$ARGV[0]: $!\n");$|=1;select(F);$|=1;while(<STDIN>){my $p=sprintf("[%5ds] ", time()-'$STARTTIME');print STDOUT $p.$_;print F $p.$_}' $LOGFILE) 2>&1
+    fi
+fi
+
+setmemorylimit
+
+#
+# say hello
+#
+test -z "$HOST" && HOST=`hostname`
+
+if test -z "$RUNNING_IN_VM" ; then
+    echo Using BUILD_ROOT=$BUILD_ROOT
+    test -n "$BUILD_RPMS" && echo Using BUILD_RPMS=$BUILD_RPMS
+    echo Using BUILD_ARCH=$BUILD_ARCH
+    test -n "$VM_TYPE" && echo "Doing $VM_TYPE build${VM_ROOT:+ in $VM_ROOT}"
+    echo
+fi
+
+test "$BUILD_ARCH" = all && BUILD_ARCH=
+BUILD_USER_ABUILD_USED=
+
+for RECIPEFILE in "${RECIPEFILES[@]}" ; do
+
+    SRCDIR="${RECIPEFILE%/*}"
+    RECIPEFILE="${RECIPEFILE##*/}"
+
+    recipe_set_buildtype
+
+    if test -z "$RUNNING_IN_VM" ; then
+	echo
+	echo "$HOST started \"build $RECIPEFILE\" at `date --utc`."
+	echo
+	test -n "$REASON" && echo "$REASON"
+	echo
+        TIME_START_TIME=`date +%s` # for statistics
+    fi
+
+    #
+    # first setup building directory...
+    #
+    cd "$SRCDIR"
+    if ! test -s "$RECIPEFILE" ; then
+	 cleanup_and_exit 1 "$RECIPEFILE is empty.  This should not happen..."
+    fi
+    MYSRCDIR="$SRCDIR"
+
+    # special hack to build from a .src.rpm (modifies MYSRCDIR)
+    test "$RECIPEFILE" != "${RECIPEFILE%.src.rpm}" && recipe_unpack_srcrpm
+
+    echo "processing recipe $MYSRCDIR/$RECIPEFILE ..."
+
+    ADDITIONAL_PACKS=
+    test -z "$BUILD_EXTRA_PACKS" || ADDITIONAL_PACKS="$ADDITIONAL_PACKS $BUILD_EXTRA_PACKS"
+    test -z "$CREATE_BASELIBS" || ADDITIONAL_PACKS="$ADDITIONAL_PACKS build"
+    test -z "$CCACHE" || ADDITIONAL_PACKS="$ADDITIONAL_PACKS ccache"
+    test "$icecream" = 0 || ADDITIONAL_PACKS="$ADDITIONAL_PACKS icecream gcc-c++"
+    test -z "$DO_LINT" || ADDITIONAL_PACKS="$ADDITIONAL_PACKS rpmlint-Factory"
+    test "$VMDISK_FILESYSTEM" = xfs && ADDITIONAL_PACKS="$ADDITIONAL_PACKS libblkid1"
+    test "$VM_TYPE" = zvm && ADDITIONAL_PACKS="$ADDITIONAL_PACKS udev libcap2"
+
+    # we need to do this before the vm is started
+    if test -n "$CHANGELOG" -a -z "$RUNNING_IN_VM" -a -z "$RUN_SHELL" ; then
+        recipe_create_changelog "$MYSRCDIR/$RECIPEFILE"
+    fi
+
+    if test -n "$VM_TYPE" -a -z "$RUNNING_IN_VM" ; then
+	vm_first_stage
+	cleanup_and_exit
+    fi
+
+    if test "$DO_INIT" = true ; then
+        start_time=`date +%s`
+	#
+	# create legacy .buildenv file
+	#
+	test -z "$INCARNATION" && INCARNATION=0
+	echo "BUILD_INCARNATION=$INCARNATION" > $BUILD_ROOT/.buildenv
+	Q="'\''"
+	test -n "$DISTURL" && echo "BUILD_DISTURL='${DISTURL//"'"/$Q}'" >> $BUILD_ROOT/.buildenv
+	test "$BUILDTYPE" = preinstallimage && mkdir -p $BUILD_ROOT/.preinstall_image
+	CREATE_BUILD_BINARIES=
+	if recipe_needs_build_binaries "$MYSRCDIR/$RECIPEFILE" ; then
+	    CREATE_BUILD_BINARIES=--create-build-binaries
+	fi
+	set -- init_buildsystem --configdir "$CONFIG_DIR" --cachedir "$CACHE_DIR" "${initbuildsysstuff[@]}" "${definesnstuff[@]}" "${repos[@]}" $CLEAN_BUILD $DLNOSIGNATURE $USEUSEDFORBUILD $CREATE_BUILD_BINARIES $RPMLIST "$MYSRCDIR/$RECIPEFILE" $ADDITIONAL_PACKS
+	echo "$* ..."
+        start_time=`date +%s`
+	"$@" || cleanup_and_exit 1
+	check_exit
+        TIME_INSTALL=$(( `date +%s` - $start_time ))
+        unset start_time
+	# arbitrary limit of 10MB
+	if test $((`stat -f -c "%a*%S/1024/1024" $BUILD_ROOT`)) -lt 10; then
+            # ensure that old stat is not failing (RHEL4)
+            if df $BUILD_ROOT 2>/dev/null | grep -q "100%"; then
+		df -h $BUILD_ROOT
+		cleanup_and_exit 1 "build does not work on a completely full filesystem"
+	    fi
+	fi
+	copy_oldpackages
+        # chroot based builds
+        # rsync as source and dest could be same
+        test -n "$PKG_CCACHE" -a -e "$PKG_CCACHE" && \
+            mkdir -p "$BUILD_ROOT/.build.oldpackages/" && \
+            rsync -v "$PKG_CCACHE" "$BUILD_ROOT/.build.oldpackages/_ccache.tar"
+    fi
+
+    mount_stuff
+
+    # hack to process preinstallimages early
+    if test "$BUILDTYPE" = preinstallimage ; then
+	recipe_build
+	continue
+    fi
+
+    if test -z "$BUILD_DIST" -a -e "$BUILD_ROOT/.guessed_dist" ; then
+	read BUILD_DIST < $BUILD_ROOT/.guessed_dist
+    fi
+
+    #
+    # install dummy sign program if needed
+    #
+    test -f $BUILD_ROOT/usr/bin/sign_installed && mv $BUILD_ROOT/usr/bin/sign_installed $BUILD_ROOT/usr/bin/sign
+    if test -n "$SIGNDUMMY" ; then
+	test -f $BUILD_ROOT/usr/bin/sign && mv $BUILD_ROOT/usr/bin/sign $BUILD_ROOT/usr/bin/sign_installed
+	cp $BUILD_DIR/signdummy $BUILD_ROOT/usr/bin/sign
+	chmod 755 $BUILD_ROOT/usr/bin/sign
+    fi
+
+    #
+    # check if we want to build with the abuild user
+    #
+    BUILD_USER=abuild
+    if test -x $BUILD_ROOT/bin/rpm ; then
+	SUSE_VERSION=`chroot $BUILD_ROOT /bin/rpm --eval '%{?suse_version}' 2>/dev/null`
+	test -n "$SUSE_VERSION" -a "${SUSE_VERSION:-0}" -le 1020 && BUILD_USER=root
+    fi
+    if test "$BUILD_USER" = abuild ; then
+	egrep '^#[[:blank:]]*needsrootforbuild[[:blank:]]*$' >/dev/null <$RECIPEFILE && BUILD_USER=root
+    else
+	egrep '^#[[:blank:]]*norootforbuild[[:blank:]]*$' >/dev/null <$RECIPEFILE && BUILD_USER=abuild
+    fi
+    test -n "$NOROOTFORBUILD" && BUILD_USER=abuild
+
+    # appliance builds must run as root
+    if test "$BUILDTYPE" = kiwi ; then
+	imagetype=$(perl -I$BUILD_DIR -MBuild::Kiwi -e Build::Kiwi::show $RECIPEFILE imagetype)
+	test "$imagetype" = product || BUILD_USER=root
+    fi
+    # same with docker and fissile builds
+    if test "$BUILDTYPE" = docker -o "$BUILDTYPE" = fissile -o "$BUILDTYPE" = podman ; then
+	BUILD_USER=root
+    fi
+
+    # fixup passwd/group
+    if test $BUILD_USER = abuild ; then
+	if ! egrep '^abuild:' >/dev/null <$BUILD_ROOT/etc/passwd ; then
+	    echo "abuild:x:${ABUILD_UID}:${ABUILD_GID}:Autobuild:/home/abuild:/bin/bash" >>$BUILD_ROOT/etc/passwd
+	    echo 'abuild:*:::::::' >>$BUILD_ROOT/etc/shadow # This is needed on Mandriva 2009
+	    echo 'abuild:*::' >>$BUILD_ROOT/etc/gshadow # This is needed on Ubuntu
+	    echo "abuild:x:${ABUILD_GID}:" >>$BUILD_ROOT/etc/group
+	    mkdir -p $BUILD_ROOT/home/abuild
+	    chown "$ABUILD_UID:$ABUILD_GID" $BUILD_ROOT/home/abuild
+	else
+	    if ! egrep "^abuild:x?:${ABUILD_UID}:${ABUILD_GID}" >/dev/null <$BUILD_ROOT/etc/passwd ; then
+		echo "abuild user present in the buildroot ($BUILD_ROOT) but uid:gid does not match"
+		echo "buildroot currently using:"
+		egrep "^abuild:" <$BUILD_ROOT/etc/passwd
+		echo "build script attempting to use:"
+		echo "abuild::${ABUILD_UID}:${ABUILD_GID}:..."
+		echo "build aborting"
+		cleanup_and_exit 1
+	    fi
+	fi
+	if test -f $BUILD_ROOT/etc/shadow ; then
+	    sed -i -e "s@^root::@root:*:@" $BUILD_ROOT/etc/shadow
+	fi
+	if test -f $BUILD_ROOT/etc/gshadow ; then
+	    sed -i -e "s@^root::@root:*:@" $BUILD_ROOT/etc/gshadow
+	fi
+	BUILD_USER_ABUILD_USED=true
+    else
+	# building as root
+	ABUILD_UID=0
+	ABUILD_GID=0
+	if egrep '^abuild:' >/dev/null <$BUILD_ROOT/etc/passwd ; then
+	    rm -rf "$BUILD_ROOT/home/abuild"
+	    sed -i -e '/^abuild:/d' $BUILD_ROOT/etc/passwd
+	    sed -i -e '/^abuild:/d' $BUILD_ROOT/etc/group
+	    if test -f $BUILD_ROOT/etc/shadow ; then
+		sed -i -e '/^abuild:/d' $BUILD_ROOT/etc/shadow
+	    fi
+	    if test -f $BUILD_ROOT/etc/gshadow ; then
+		sed -i -e '/^abuild:/d' $BUILD_ROOT/etc/gshadow
+	    fi
+	fi
+    fi
+
+    if test -n "$RUNNING_IN_VM" ; then
+	vm_setup_network
+    fi
+
+    setupicecream
+    setupccache
+
+    if test -n "$RUN_SHELL" ; then
+	if test -n "$RUN_SHELL_CMD"; then
+	  chroot $BUILD_ROOT "${RUN_SHELL_CMD:=/bin/bash}"
+          cleanup_and_exit $?
+	else
+	  chroot $BUILD_ROOT su - $BUILD_USER
+          cleanup_and_exit $?
+        fi
+    fi
+
+    # fill build directories with sources. Also sets TOPDIR
+    recipe_setup
+    
+    # strip prefix from autogenerated files of source services.
+    # sorted by line length to let the latest run service win
+    perl -e 'print "$_\n" for sort { length($a) <=> length($b) } @ARGV' $BUILD_ROOT$TOPDIR/SOURCES/_service\:* | while read i ; do
+        mv "$i" "${i%/*}/${i##*:}"
+    done
+    RECIPEFILE="${RECIPEFILE##*:}"
+
+    # create .build.packages link
+    rm -f $BUILD_ROOT/.build.packages
+    ln -s ${TOPDIR#/} $BUILD_ROOT/.build.packages
+
+    # nasty hack to prevent rpath on known paths
+    # FIXME: do this only for suse
+    if test -d "$BUILD_ROOT/etc/profile.d" ; then
+	echo "export SUSE_IGNORED_RPATHS=/etc/ld.so.conf" > "$BUILD_ROOT/etc/profile.d/buildsystem.sh"
+    fi
+
+    cd $BUILD_ROOT$TOPDIR/SOURCES || cleanup_and_exit 1
+    for i in *.obscpio ; do
+	test -e "$i" || continue
+	echo "Unpacking $i ..."
+	echo "#!/bin/sh -e" > $BUILD_ROOT/.unpack.command
+	shellquote cd "$TOPDIR/SOURCES" >> $BUILD_ROOT/.unpack.command
+	echo >> $BUILD_ROOT/.unpack.command
+	echo -n 'cpio --extract --owner="'$BUILD_USER'" --unconditional --preserve-modification-time --make-directories <' >> $BUILD_ROOT/.unpack.command
+	shellquote "$i" >> $BUILD_ROOT/.unpack.command
+	echo >> $BUILD_ROOT/.unpack.command
+	shellquote rm -f "$i" >> $BUILD_ROOT/.unpack.command
+	echo >> $BUILD_ROOT/.unpack.command
+	chmod 0755 $BUILD_ROOT/.unpack.command
+	chroot $BUILD_ROOT su -c /.unpack.command - $BUILD_USER || cleanup_and_exit 1
+	rm -f $BUILD_ROOT/.unpack.command
+    done
+
+    if  test -e _service; then
+	echo "Running build time source services..."
+	$BUILD_DIR/runservices --buildroot "$BUILD_ROOT" || cleanup_and_exit 1
+    fi
+
+    # get rid of old src dir, it is no longer needed and just wastes space
+    test "$MYSRCDIR" = $BUILD_ROOT/.build-srcdir && rm -rf "$MYSRCDIR"
+
+    # patch recipes
+    recipe_prepare
+
+    # hmmm
+    chown -R "$ABUILD_UID:$ABUILD_GID" "$BUILD_ROOT$TOPDIR"
+
+    echo -----------------------------------------------------------------
+    if test "$BUILD_USER" = root ; then
+	echo ----- building $RECIPEFILE
+    else
+	echo ----- building $RECIPEFILE "(user $BUILD_USER)"
+    fi
+    echo -----------------------------------------------------------------
+    echo -----------------------------------------------------------------
+    BUILD_SUCCEEDED=false
+
+    if test -n "$OVERLAY" ; then
+	copy_overlay
+    fi
+
+    if test -n "$RSYNCSRC" ; then
+	run_rsync
+    fi
+
+    RECIPE_BUILD_START_TIME=`date +%s`
+    GEN_BUILDREQS_PACKS=()
+    recipe_build
+
+    if test "$BUILD_SUCCEEDED" = genbuildreqs -a "$DO_INIT" = true -a -z "$RPMLIST" -a -z "$RUNNING_IN_VM" -a -n "${GEN_BUILDREQS_PACKS[*]}" ; then
+	# re-expand deps with GEN_BUILDREQS_PACKS extra packages
+	umount_stuff
+	set -- init_buildsystem --configdir "$CONFIG_DIR" --cachedir "$CACHE_DIR" "${initbuildsysstuff[@]}" "${definesnstuff[@]}" "${repos[@]}" $DLNOSIGNATURE $USEUSEDFORBUILD $CREATE_BUILD_BINARIES $RPMLIST "$MYSRCDIR/$RECIPEFILE" $ADDITIONAL_PACKS "${GEN_BUILDREQS_PACKS[@]}"
+	echo "$* ..."
+	"$@" || cleanup_and_exit 1
+	check_exit
+	mount_stuff
+	BUILD_SUCCEEDED=false
+	recipe_build
+    fi
+
+    if test "$BUILD_SUCCEEDED" = genbuildreqs ; then
+	recipe_cleanup
+	if test -n "$RUNNING_IN_VM" ; then
+	    vm_exit_statistics
+	    vm_wrapup_build OTHER
+	fi
+	cleanup_and_exit 9
+    fi
+
+    test "$BUILD_SUCCEEDED" = true || cleanup_and_exit 1
+
+    recipe_build_time_statistics
+    recipe_gendiff
+    recipe_cleanup
+
+    test -d "$SRCDIR" && cd "$SRCDIR"
+
+    umount_stuff
+done
+
+if test -n "$RUNNING_IN_VM" ; then
+    vm_exit_statistics
+fi
+
+# mount /proc again for the post processing steps
+if test -n "$BUILD_ROOT" -a "$BUILD_ROOT" != / ; then
+    mount -n -tproc none $BUILD_ROOT/proc
+fi
+
+RPMS=`find $BUILD_ROOT/$TOPDIR/RPMS -type f -name "*.rpm" 2>/dev/null || true`
+DEBS=`find $BUILD_ROOT/$TOPDIR/DEBS -type f "(" -name "*.deb" -o -name "*.ddeb" -o -name "*.udeb" ")" 2>/dev/null || true`
+
+if test -n "$RPMS" -a -n "$BUILD_USER_ABUILD_USED" ; then
+    recipe_check_file_owners
+fi
+
+TIME_POSTCHECKS=0
+TIME_RPMLINT=0
+TIME_BUILDCMP=0
+TIME_DELTARPMS=0
+
+if test -n "$RPMS" -a -d "$BUILD_ROOT/usr/lib/build/checks" ; then
+    export DO_RPM_REMOVE=true
+    # workaround for broken 13.1 check scripts which umount /proc
+    if test -n "$RUNNING_IN_VM" -a "$BUILD_ROOT" = / ; then
+        umount -n $BUILD_ROOT/proc/sys/fs/binfmt_misc 2>/dev/null
+    fi
+    # find package name
+    export PNAME=
+    for SRPM in $BUILD_ROOT/$TOPDIR/SRPMS/*src.rpm ; do
+	test -f "$SRPM" && PNAME=`rpm --nodigest --nosignature -qp --qf "%{NAME}" $SRPM`
+    done
+    TIME_POSTCHECKS=`date +%s`
+    for CHECKSCRIPT in $BUILD_ROOT/usr/lib/build/checks/* ; do
+	echo "... running ${CHECKSCRIPT##*/}"
+	BUILD_ROOT=/ chroot "$BUILD_ROOT" "/usr/lib/build/checks/${CHECKSCRIPT##*/}" || cleanup_and_exit 1
+    done
+    TIME_POSTCHECKS=$(( `date +%s` - $TIME_POSTCHECKS ))
+    # workaround for broken 13.1 check scripts which umount /proc
+    test -e "$BUILD_ROOT/proc/self" || mount -n -tproc none $BUILD_ROOT/proc
+fi
+
+# checkscripts may have deleted some binaries
+RPMS=`find $BUILD_ROOT/$TOPDIR/RPMS -type f -name "*.rpm" 2>/dev/null || true`
+DEBS=`find $BUILD_ROOT/$TOPDIR/DEBS -type f -name "*.deb" 2>/dev/null || true`
+
+if test -n "$RPMS" -a "$DO_CHECKS" != false ; then
+    TIME_RPMLINT=`date +%s`
+    recipe_run_rpmlint
+    TIME_RPMLINT=$(( `date +%s` - $TIME_RPMLINT ))
+fi
+
+if test -n "$CCACHE" ; then
+    if test -n "$REMOVE_CCACHE" ; then
+        echo "... cleaning ccache"
+        test_cmd="ccache -h | grep -c evict-older-than"
+        clean_cmd="ccache --evict-older-than $(($(date +%s) - $CCACHE_SETUP_START_TIME))s"
+        chroot $BUILD_ROOT su -c "$test_cmd && $clean_cmd" - $BUILD_USER
+    fi
+    echo "... saving ccache"
+    tar ${REMOVE_CCACHE:+--remove-files} -cf "$BUILD_ROOT/$TOPDIR/OTHER/_ccache.tar" -C "$BUILD_ROOT/.ccache/" .
+fi
+
+if test \( -n "$RPMS" -o -n "$DEBS" \) -a -n "$CREATE_BASELIBS"; then
+    create_baselibs
+fi
+
+exitcode=0
+
+# post build work
+# TODO: don't hardcode. instead run scripts in a directory as it's done for the checks
+if test -n "$RPMS" -a -d "$BUILD_ROOT/.build.oldpackages" ; then
+    TIME_BUILDCMP=`date +%s`
+    recipe_compare_oldpackages
+    TIME_BUILDCMP=$(( `date +%s` - $TIME_BUILDCMP ))
+    # no need to create deltas if the build is the same
+    if test ! -e $BUILD_ROOT/.build/.same_result_marker ; then
+	TIME_DELTARPMS=`date +%s`
+	recipe_create_deltarpms
+	TIME_DELTARPMS=$(( `date +%s` - $TIME_DELTARPMS ))
+    fi
+fi
+
+if test -n "$RUNNING_IN_VM" ; then
+    vm_wrapup_build $(recipe_resultdirs) OTHER
+fi
+
+echo
+echo "$HOST finished \"build $RECIPEFILE\" at `date --utc`."
+echo
+
+cleanup_and_exit "$exitcode"

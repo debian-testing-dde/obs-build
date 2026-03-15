@@ -1,0 +1,130 @@
+#################################################################
+#
+# snapcraft specific functions.
+#
+# Author: Adrian Schroeter <adrian@suse.de>
+#
+################################################################
+#
+# Copyright (c) 2016 SUSE Linux Products GmbH
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License version 2 or 3 as
+# published by the Free Software Foundation.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program (see the file COPYING); if not, write to the
+# Free Software Foundation, Inc.,
+# 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA
+#
+################################################################
+
+recipe_setup_snapcraft() {
+    TOPDIR=/usr/src/packages
+    test "$DO_INIT_TOPDIR" = false || rm -rf "$BUILD_ROOT$TOPDIR"
+    for i in OTHER SOURCES SNAPCRAFT_ROOT ; do
+	mkdir -p "$BUILD_ROOT$TOPDIR/$i"
+    done
+    chown -R "$ABUILD_UID:$ABUILD_GID" "$BUILD_ROOT$TOPDIR"
+    if test "$MYSRCDIR" = $BUILD_ROOT/.build-srcdir ; then
+	mv "$MYSRCDIR"/* $BUILD_ROOT$TOPDIR/SOURCES/
+    else
+	cp -p "$MYSRCDIR"/* $BUILD_ROOT$TOPDIR/SOURCES/
+    fi
+}
+
+recipe_prepare_snapcraft() {
+    :
+}
+
+collect_prebuild_parts() {
+
+  mkdir -p $BUILD_ROOT/root/.local/share/snapcraft/
+  rm -f $BUILD_ROOT/root/.local/share/snapcraft/parts.yaml
+  for part in $BUILD_ROOT/.build.snap_parts/*; do
+    if [ -e "$part" ]; then
+      cat "$part/part.yaml" >> \
+          $BUILD_ROOT/root/.local/share/snapcraft/parts.yaml
+    fi
+  done
+}
+
+# This script expects that the $BUILD_ROOT is a Debian installation with
+# snapcraft already installed!
+#
+# Variables:
+# $BUILD_ROOT the Debian chroot
+# $TOPDIR/SOURCES includes the snapcraft sources
+# $TOPDIR/$SNAPCRAFT_ROOT where snapcraft will be called
+# $RECIPEFILE the name of the snapcraft.yaml config file
+
+recipe_build_snapcraft() {
+    local ARCH=$(chroot $BUILD_ROOT su -c "dpkg-architecture -qDEB_BUILD_ARCH")
+    local DIST="OBS"
+    local SNAPCRAFT_ROOT="SNAPCRAFT_ROOT"
+
+    [ -z "${ARCH}" -o -z "${DIST}" ] && cleanup_and_exit 1
+
+    test -d $BUILD_ROOT/.build.binaries || cleanup_and_exit 1
+    if test "$DO_INIT" = true -o ! -d "$BUILD_ROOT/.build.binaries/dists" ; then
+	echo "creating repository metadata..."
+        createrepo_debian $BUILD_ROOT/.build.binaries ${ARCH} ${DIST}
+        # setup /etc/apt/sources.list
+        mkdir -p "$BUILD_ROOT/etc/apt"
+        echo "deb [trusted=yes] file:/.build.binaries OBS main" >> "$BUILD_ROOT/etc/apt/sources.list"
+    fi
+
+    collect_prebuild_parts
+
+    chroot $BUILD_ROOT su -c "cd $TOPDIR/SOURCES && snapcraft pull" - root \
+	|| cleanup_and_exit 1
+    chroot $BUILD_ROOT su -c "cd $TOPDIR/SOURCES && snapcraft build" - root \
+	|| cleanup_and_exit 1
+    chroot $BUILD_ROOT su -c "cd $TOPDIR/SOURCES && snapcraft snap" - root \
+	|| cleanup_and_exit 1
+
+    # extract build result basenames
+    local build_results=""
+    for i in $BUILD_ROOT/$TOPDIR/SOURCES/* ; do
+	test -f "$i" || continue
+	case "${i##*/}" in
+	    *.snap)
+		build_results="${build_results}\n${i%%.snap}"
+		;;
+	    *)
+		;;
+	esac
+    done
+
+    # Fail the build if no build results are found
+    if [ -z "${build_results}" ] ; then
+	cleanup_and_exit 1 "No live-build result found"
+    fi
+
+    # move created products (and their metadata files) to destination
+    local buildnum="${RELEASE:+-Build${RELEASE}}"
+    for prefix in $(echo -e ${build_results} | sort | uniq) ; do
+	for f in ${prefix}.* ; do
+	    mv ${f} \
+		$BUILD_ROOT/$TOPDIR/OTHER/${prefix##*/}${buildnum}${f#${prefix}}
+	    BUILD_SUCCEEDED=true
+	done
+    done
+}
+
+recipe_resultdirs_snapcraft() {
+    :
+}
+
+recipe_cleanup_snapcraft() {
+    :
+}
+
+# Local Variables:
+# mode: Shell-script
+# End:

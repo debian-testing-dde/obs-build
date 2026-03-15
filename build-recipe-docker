@@ -1,0 +1,221 @@
+#################################################################
+#
+# Docker specific functions.
+#
+################################################################
+#
+# Copyright (c) 2017 SUSE Linux Products GmbH
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License version 2 or 3 as
+# published by the Free Software Foundation.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program (see the file COPYING); if not, write to the
+# Free Software Foundation, Inc.,
+# 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA
+#
+################################################################
+
+DOCKERD_STARTED=
+
+recipe_setup_docker() {
+    TOPDIR="/usr/src/packages"
+    test "$DO_INIT_TOPDIR" != false && rm -Rf "$BUILD_ROOT/$TOPDIR"
+    mkdir -p "$BUILD_ROOT$TOPDIR/SOURCES"
+    if test "$MYSRCDIR" = $BUILD_ROOT/.build-srcdir ; then 
+        mv "$MYSRCDIR"/* $BUILD_ROOT$TOPDIR/SOURCES/
+    else
+        if test -z "$LINKSOURCES" ; then 
+            cp -dLR "$MYSRCDIR"/* $BUILD_ROOT$TOPDIR/SOURCES/
+        else
+            cp -lR "$MYSRCDIR"/* $BUILD_ROOT$TOPDIR/SOURCES/
+        fi
+        if test "$?" != 0 ; then 
+            cleanup_and_exit 1 "source copy failed"
+        fi
+    fi  
+}
+
+recipe_prepare_docker() {
+    :
+}
+
+# Variables:
+# $BUILD_ROOT is the chroot
+# $TOPDIR/SOURCES includes the docker sources
+# $TOPDIR/$DOCKERIMAGE_ROOT where docker will be called
+# $RECIPEFILE the name of the Dockerfile
+
+recipe_build_docker() {
+    touch $BUILD_ROOT/etc/resolv.conf
+
+    base_image_path=
+    base_image_tag=$(grep "^\s*FROM" "$RECIPEFILE" | head -n 1 | cut -d" " -f2)
+
+    if test "$base_image_tag" != scratch ; then
+	base_image_path=$(find containers -regextype egrep -regex ".*\.(tgz|tar|tar\.xz|tar\.gz)$" -print -quit)
+	test -f "$base_image_path" || cleanup_and_exit 1 "base image not found"
+    fi
+
+    if test "$BUILDENGINE" = podman; then
+        DOCKER_TOOL=podman
+    else
+        DOCKER_TOOL=docker
+        if ! $BUILD_DIR/startdockerd --root "$BUILD_ROOT" --webserver "$TOPDIR/SOURCES/repos" --webserver-upload "$TOPDIR/SOURCES/repos/UPLOAD" ; then
+             cleanup_and_exit 1
+        fi
+    fi
+    DOCKERD_STARTED=true
+
+    if test "$DOCKER_TOOL" = podman; then
+	sed -e "s!^DATA_DIR=!DATA_DIR=$TOPDIR/SOURCES/repos!" <"$BUILD_DIR/obs-docker-support" >"$BUILD_ROOT/$TOPDIR/SOURCES/.obs-docker-support"
+    else
+	cp $BUILD_DIR/obs-docker-support "$BUILD_ROOT/$TOPDIR/SOURCES/.obs-docker-support"
+    fi
+    chmod 755 "$BUILD_ROOT/$TOPDIR/SOURCES/.obs-docker-support"
+
+    if test -n "$base_image_path"; then
+	echo "Loading base image"
+	if test -L "$base_image_path" ; then
+	    # copy into build root
+	    cp -L "$base_image_path" "$base_image_path.lnk"
+	    mv "$base_image_path.lnk" "$base_image_path"
+	fi
+
+	# Inspect the content of the image to decide if this is a layered image
+	# or a filesystem one. We need to know if we will "docker load" it or
+	# "docker import" it.
+	if tar -tf $base_image_path | grep -q "^manifest.json" ; then
+	    echo "Layered image found"
+	    chroot $BUILD_ROOT $DOCKER_TOOL load --input $TOPDIR/SOURCES/$base_image_path
+	else
+	    echo "Filesystem image found"
+	    chroot $BUILD_ROOT $DOCKER_TOOL import $TOPDIR/SOURCES/$base_image_path "$base_image_tag"
+	fi
+    fi
+
+    # Prepare the package repository
+    rm -rf "$BUILD_ROOT/$TOPDIR/SOURCES/repos/UPLOAD"
+    if chroot $BUILD_ROOT test -x /usr/bin/createrepo ; then
+	chroot $BUILD_ROOT createrepo "$TOPDIR/SOURCES/repos" >/dev/null
+    fi
+    if chroot $BUILD_ROOT test -x /usr/bin/dpkg-scanpackages ; then
+	chroot $BUILD_ROOT bash -c "cd $TOPDIR/SOURCES/repos && dpkg-scanpackages -m . | gzip > Packages.gz"
+    fi
+    mkdir -p "$BUILD_ROOT/$TOPDIR/SOURCES/repos/UPLOAD"
+
+    # find tags, first look into recipe file
+    FIRSTTAG=
+    ALLTAGS=
+    args=()
+    test -n "$RELEASE" && args=("${args[@]}" --release "$RELEASE")
+    for t in $(perl -I$BUILD_DIR -MBuild::Docker -e Build::Docker::show -- "${args[@]}" "$BUILD_ROOT/$TOPDIR/SOURCES/$RECIPEFILE" containertags) ; do
+	test -n "$FIRSTTAG" || FIRSTTAG="$t"
+        ALLTAGS="$ALLTAGS $t"
+    done
+    # if we did not find a tag, look info a file called TAG
+    if test -z "$FIRSTTAG" -a -f TAG ; then
+	for t in $(egrep -v '^#' TAG) ; do
+	    test -n "$FIRSTTAG" || FIRSTTAG="$t"
+	    ALLTAGS="$ALLTAGS $t"
+	done
+    fi
+    if test -z "$FIRSTTAG" ; then
+        cleanup_and_exit 1 "please specify a tag for the container"
+    fi
+    ALLTAGS="${ALLTAGS# }"
+
+    tagargs=()
+    for t in $ALLTAGS; do
+	tagargs[${#tagargs[@]}]='-t'
+	tagargs[${#tagargs[@]}]="$t"
+    done
+
+    buildargs=()
+    while read kv ; do
+	case "$kv" in
+	    [a-zA-Z0-9_]*=*)
+		buildargs[${#buildargs[@]}]='--build-arg'
+		buildargs[${#buildargs[@]}]="$kv"
+		;;
+	esac
+    done < <( queryconfig --dist "$BUILD_DIST" --configdir "$CONFIG_DIR" --archpath "$BUILD_ARCH" buildflags+ dockerarg )
+
+    # patch in obs-docker-support helper
+    patchdockerfile < "$BUILD_ROOT/$TOPDIR/SOURCES/$RECIPEFILE" > "$BUILD_ROOT/$TOPDIR/SOURCES/.$RECIPEFILE" && \
+       mv "$BUILD_ROOT/$TOPDIR/SOURCES/.$RECIPEFILE" "$BUILD_ROOT/$TOPDIR/SOURCES/$RECIPEFILE"
+    test -n "$DISTURL" && echo "LABEL org.openbuildservice.disturl=$DISTURL" >> "$BUILD_ROOT/$TOPDIR/SOURCES/$RECIPEFILE"
+
+    # now do the build
+    squashopt=--squash
+    if test -n "$(perl -I$BUILD_DIR -MBuild::Docker -e Build::Docker::show -- "$BUILD_ROOT/$TOPDIR/SOURCES/$RECIPEFILE" nosquash)" ; then
+	squashopt=
+	echo "Building image $ALLTAGS (nosquash)"
+    else
+	echo "Building image $ALLTAGS"
+    fi
+
+
+    if test "$DOCKER_TOOL" = podman ; then
+	test -n "$squashopt" && squashopt="--layers=false"
+	if ! $BUILD_DIR/call-podman --root "$BUILD_ROOT" build $squashopt -v "$TOPDIR/SOURCES/repos:$TOPDIR/SOURCES/repos" --network=host "${tagargs[@]}" "${buildargs[@]}" -f "$TOPDIR/SOURCES/$RECIPEFILE" $TOPDIR/SOURCES/ ; then
+	    cleanup_and_exit 1 "$DOCKER_TOOL build command failed"
+	fi
+    else
+	if ! chroot $BUILD_ROOT $DOCKER_TOOL build $squashopt --network=host "${tagargs[@]}" "${buildargs[@]}" -f "$TOPDIR/SOURCES/$RECIPEFILE" $TOPDIR/SOURCES/ ; then
+	    cleanup_and_exit 1 "$DOCKER_TOOL build command failed"
+	fi
+    fi
+
+    # Save the resulting image to a tarball. Use first tag for generating the file name.
+    mkdir -p $BUILD_ROOT$TOPDIR/DOCKER
+    FILENAME="$FIRSTTAG"
+    FILENAME="${FILENAME//[\/:]/-}"
+    FILENAME="$FILENAME.${BUILD_ARCH%%:*}"
+    test -n "$RELEASE" && FILENAME="$FILENAME-$RELEASE"
+    echo "Saving image $FIRSTTAG to $FILENAME.tar"
+    if ! chroot $BUILD_ROOT $DOCKER_TOOL save --output "$TOPDIR/DOCKER/$FILENAME.tar" "$FIRSTTAG" ; then
+        cleanup_and_exit 1 "$DOCKER_TOOL save command failed"
+    fi
+    
+    # Create containerinfo
+    args=()
+    test -n "$DISTURL" && args=("${args[@]}" --disturl "$DISTURL")
+    test -n "$RELEASE" && args=("${args[@]}" --release "$RELEASE")
+    perl -I$BUILD_DIR -MBuild::Docker -e Build::Docker::showcontainerinfo -- "${args[@]}" "$BUILD_ROOT/$TOPDIR/SOURCES/$RECIPEFILE" "$FILENAME.tar" "$ALLTAGS" containers/annotation > "$BUILD_ROOT$TOPDIR/DOCKER/$FILENAME.containerinfo"
+
+    # copy over .packages files
+    if test -f "$BUILD_ROOT/$TOPDIR/SOURCES/repos/UPLOAD/basepackages" ; then
+	cp "$BUILD_ROOT/$TOPDIR/SOURCES/repos/UPLOAD/basepackages" "$BUILD_ROOT$TOPDIR/DOCKER/$FILENAME.basepackages"
+    fi
+    if test -f "$BUILD_ROOT/$TOPDIR/SOURCES/repos/UPLOAD/packages" ; then
+	cp "$BUILD_ROOT/$TOPDIR/SOURCES/repos/UPLOAD/packages" "$BUILD_ROOT$TOPDIR/DOCKER/$FILENAME.packages"
+    fi
+    rm -rf "$BUILD_ROOT/$TOPDIR/SOURCES/repos/UPLOAD"
+
+    # We're done. Clean up.
+    recipe_cleanup_docker
+    BUILD_SUCCEEDED=true
+}
+
+recipe_resultdirs_docker() {
+    echo DOCKER
+}
+
+recipe_cleanup_docker() {
+    if test -n "$DOCKERD_STARTED" ; then
+	test -n "$TOPDIR" && rm -f "$BUILD_ROOT/$TOPDIR/SOURCES/.obs-docker-support"
+	DOCKERD_STARTED=
+	$BUILD_DIR/startdockerd --root "$BUILD_ROOT" --kill
+    fi
+}
+
+# Local Variables:
+# mode: Shell-script
+# End:

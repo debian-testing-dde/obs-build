@@ -1,0 +1,1184 @@
+#!/bin/bash
+# Script to create a complete system to build packages in a chroot
+# environment.  This script ensures, that all packages given as
+# parameter are installed. All other packges will be deleted.
+#
+# BUILD_ROOT  here the packages will be installed/deleted
+# BUILD_RPMS  here we get our packages to install (obsolete)
+# BUILD_ARCH  path of the architectures we try
+# BUILD_DIST  distribution to build for (will be guessed if not set)
+#
+################################################################
+#
+# Copyright (c) 1997-2014 SUSE Linux Products GmbH
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License version 2 or 3 as
+# published by the Free Software Foundation.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program (see the file COPYING); if not, write to the
+# Free Software Foundation, Inc.,
+# 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA
+#
+################################################################
+
+#
+# needed globals variables
+#
+export SRC
+export BUILD_DIR=${BUILD_DIR:-/usr/lib/build}
+PATH="$BUILD_DIR:$PATH"
+
+export YAST_IS_RUNNING=instsys
+# https://github.com/systemd/systemd/blob/master/docs/ENVIRONMENT.md
+export SYSTEMD_OFFLINE=1
+
+# slurp in package binary support
+. "$BUILD_DIR/build-pkg"
+
+# need to restore build root owner for non-root builds
+browner=0
+definesnstuff=()
+repos=()
+
+. $BUILD_DIR/common_functions || exit 1
+
+# should RPMs be installed with --force ?
+USE_FORCE=false
+PREPARE_VM=
+USEUSEDFORBUILD=
+LIST_STATE=
+RPMLIST=
+CLEAN_BUILD=
+CREATE_BUILD_BINARIES=
+DLNOSIGNATURE=
+CACHE_DIR=/var/cache/build
+test -z "$CONFIG_DIR" && CONFIG_DIR="$BUILD_DIR/configs"
+
+while test -n "$1" ; do
+    case "$1" in
+	--prepare)
+	    shift
+	    PREPARE_VM=true
+	    ;;
+	--create-build-binaries)
+	    shift
+	    CREATE_BUILD_BINARIES=true
+	    ;;
+	--useusedforbuild)
+	    shift
+	    USEUSEDFORBUILD=--useusedforbuild
+	    ;;
+	--list-state)
+	    shift
+	    LIST_STATE=true
+	    ;;
+	--rpmlist)
+	    shift
+	    RPMLIST=$1
+	    shift
+	    ;;
+	--define|--with|--without|--buildflavor|--obspackage)
+	    definesnstuff[${#definesnstuff[@]}]="$1";
+	    definesnstuff[${#definesnstuff[@]}]="$2";
+	    shift 2
+	    ;;
+	--repository|--repo)
+	    repos[${#repos[@]}]="$2";
+	    shift 2
+	    ;;
+	--clean)
+	    CLEAN_BUILD="$1"
+	    shift
+	    ;;
+	--cachedir)
+	    CACHE_DIR="$2"
+	    shift 2
+	    ;;
+	--configdir)
+	    CONFIG_DIR="$2"
+	    shift 2
+	    ;;
+	--nosignature)
+	    shift
+	    DLNOSIGNATURE="--nosignature"
+	    ;;
+	--root)
+	    BUILD_ROOT="$2"
+	    shift 2
+	    ;;
+	--arch)
+	    BUILD_ARCH="$2"
+	    shift 2
+	    ;;
+	--dist)
+	    BUILD_DIST="$2"
+	    shift 2
+	    ;;
+	*)
+	    break
+	    ;;
+    esac
+done
+PKGS=("$@")
+
+if test -z "$BUILD_ROOT" ; then
+    echo "Please specify a build root!"
+    exit 1
+fi
+
+BUILD_IS_RUNNING=$BUILD_ROOT/not-ready
+TMPFILE=$BUILD_ROOT/tmpfile
+BUILD_INIT_CACHE="$BUILD_ROOT/.init_b_cache"
+
+#
+# needed functions
+#
+
+mount_stuff() {
+    if test "$UID" = 0 -a -n "$BUILD_ROOT" -a "$BUILD_ROOT" != / ; then
+	mount -n -tproc none "$BUILD_ROOT/proc"
+	test -e "$BUILD_ROOT/proc/self" || cleanup_and_exit 1 "Could not mount /proc, is this a container with missing capabilities?"
+	mount -n -tdevpts -omode=0620,gid=5 none "$BUILD_ROOT/dev/pts"
+    fi
+}
+
+umount_stuff() {
+    if test -n "$BUILD_ROOT" -a "$BUILD_ROOT" != / ; then
+	buildroot_umount "/proc/sys/fs/binfmt_misc"
+	buildroot_umount "/proc"
+	buildroot_umount "/sys"
+	buildroot_umount "/dev/pts"
+	buildroot_umount "/dev/shm"
+	buildroot_umount "/mnt"
+    fi
+}
+
+cleanup_and_exit() {
+    trap EXIT
+    test -z "$1" && set 0
+    if test -n "$2" ; then
+	if test "$1" -ne 0 ; then
+	    echo "$2" >&2
+	else
+	    echo "$2"
+	fi
+    fi
+    test "$BUILD_ROOT" = / -a -n "$browner" && chown "$browner" "$BUILD_ROOT"
+    # umount so init_buildsystem can be used standalone
+    umount_stuff
+    exit $1
+}
+
+clean_build_root() {
+    if test -n "$BUILD_ROOT" -a "$BUILD_ROOT" != / ; then
+	umount_stuff
+	rm -rf -- "$BUILD_ROOT"/* 2> /dev/null || true
+	chattr -a -A -i -R -- "$BUILD_ROOT" 2> /dev/null || true    # does not follow symlinks
+	rm -rf -- "$BUILD_ROOT"/*
+	rm -rf -- "$BUILD_ROOT/.build"
+	rm -rf -- "$BUILD_ROOT"/.build.kernel.*
+	rm -rf -- "$BUILD_ROOT"/.build.initrd.*
+	rm -rf -- "$BUILD_ROOT/.root"
+	rm -rf -- "$BUILD_ROOT/.init_b_cache"
+	test -L "$BUILD_ROOT/.preinstall_image" && rm -f -- "$BUILD_ROOT/.preinstall_image"
+	rm -rf -- "$BUILD_ROOT"/.preinstall_image/*
+	rm -rf -- "$BUILD_ROOT"/.preinstallimage*
+    fi
+}
+
+unsafe_preinstall_check() {
+    # cpio isn't safe so we require bsdtar for VMs. chroot is
+    # unsafe anyways so it's ok for that.
+    if test -n "$PREPARE_VM" ; then
+	echo "Error: setting up a VM requires bsdtar for security reasons."
+	echo "Please install bsdtar."
+	cleanup_and_exit 1
+    fi
+}
+
+preinstall_image_filter() {
+    for PKG in "$@" ; do
+	test -e "$BUILD_ROOT/.preinstall_image/$PKG" && continue
+	echo $PKG
+    done
+}
+
+preinstall_setup() {
+    cd "$BUILD_ROOT" || cleanup_and_exit 1
+    rm -rf build-preinstall
+    mkdir build-preinstall || cleanup_and_exit 1
+    for i in * .* ; do
+	# please keep in sync with recipe_build_preinstallimage
+	case "$i" in
+	    .|..|build-preinstall) continue ;;
+	    .build.kernel.*|.build.hostarch.*|.build.initrd.*|.build.console.*) ;;
+	    .build*|.init_b_cache|.preinstallimage*|.srcfiles*|.pkgs|.rpm-cache|installed-pkg|proc|sys) continue ;;
+	esac
+	mv "./$i" build-preinstall || cleanup_and_exit 1
+    done
+    cd build-preinstall || cleanup_and_exit 1
+}
+
+preinstall_integrate() {
+    cd "$BUILD_ROOT/build-preinstall" || cleanup_and_exit 1
+    for i in * .* ; do
+	case "$i" in
+	    .|..|build-preinstall) continue ;;
+	    .build.kernel.*|.build.hostarch.*|.build.initrd.*|.build.console.*) ;;
+	    .build*|.init_b_cache|.preinstallimage*|.srcfiles*|.pkgs|.rpm-cache|installed-pkg|proc|sys) continue ;;
+	esac
+	mv "./$i" .. || cleanup_and_exit 1
+    done
+    cd "$BUILD_ROOT" || cleanup_and_exit 1
+    assert_dirs
+}
+
+preinstall_image() {
+    check_exit
+    echo "unpacking preinstall image${2:+ $2}"
+    preinstall_setup
+    if test -x /usr/bin/bsdtar ; then
+	TAR="/usr/bin/bsdtar --exclude .build --exclude .init_b_cache -P --chroot --numeric-owner -x"
+    else
+	unsafe_preinstall_check
+	TAR="tar --exclude .build --exclude .init_b_cache -x"
+    fi
+    # pipe output through perl to print a dot every 1000 lines
+    if ! $TAR -z -f "$BUILD_INIT_CACHE/rpms/$1" -v > >(tee "$BUILD_INIT_CACHE/.preinstallimage.unpack" | perl -e '$|=1; my $done=0; $done++ % 1000 or print "." while <STDIN>; print "\n";')  2>&1 ; then
+	echo "unpack failed."
+	test -f "$BUILD_INIT_CACHE/.preinstallimage.unpack" && cat "$BUILD_INIT_CACHE/.preinstallimage.unpack"
+	cleanup_and_exit 1
+    fi
+    rm -rf "$BUILD_INIT_CACHE/.preinstallimage.unpack"
+    preinstall_integrate
+}
+
+preinstall() {
+    local PKG="$1"
+    check_exit
+    echo "preinstalling $PKG..."
+    preinstall_setup
+    if test -x /usr/bin/bsdtar ; then
+	CPIO="/usr/bin/bsdtar --exclude .build --exclude .init_b_cache -P --chroot -o --numeric-owner -x -f-"
+	TAR="/usr/bin/bsdtar --exclude .build --exclude .init_b_cache -P --chroot -o --numeric-owner -x"
+    else
+	unsafe_preinstall_check
+	CPIO="cpio --extract --unconditional --preserve-modification-time --make-directories --no-absolute-filenames --quiet"
+	TAR="tar --exclude .build --exclude .init_b_cache -x"
+    fi
+    pkg_preinstall
+    preinstall_integrate
+}
+
+run_pkg_scripts() {
+    chroot $BUILD_ROOT /sbin/ldconfig 2>/dev/null
+    for PKG in $PACKAGES_TO_RUNSCRIPTS ; do
+	pkg_runscripts
+	check_exit
+    done
+}
+
+reorder() {
+    test -z "$*" && return
+    rm -f $BUILD_ROOT/.init_b_cache/order.manifest
+    for PKG in "$@" ; do
+	echo "$PKG" >> $BUILD_ROOT/.init_b_cache/order.manifest
+    done
+    $BUILD_DIR/order --dist "$BUILD_DIST" --archpath "$BUILD_ARCH" --configdir $CONFIG_DIR --manifest $BUILD_ROOT/.init_b_cache/order.manifest $BUILD_ROOT/.init_b_cache/rpms || touch $BUILD_ROOT/exit
+    rm -f $BUILD_ROOT/.init_b_cache/order.manifest
+}
+
+create_devs() {
+    local com file mode arg
+
+    test -d $BUILD_ROOT/dev/pts -a ! -L $BUILD_ROOT/dev/pts || rm -f $BUILD_ROOT/dev/pts
+    test -d $BUILD_ROOT/dev/shm -a ! -L $BUILD_ROOT/dev/shm || rm -f $BUILD_ROOT/dev/shm
+    mkdir -m 755 -p $BUILD_ROOT/dev/pts
+    mkdir -m 755 -p $BUILD_ROOT/dev/shm
+    while read com file mode arg ; do
+	rm -f $BUILD_ROOT/dev/$file
+	if test $com = ln ; then
+	    ln -s $arg $BUILD_ROOT/dev/$file
+	elif test $com = mknod ; then
+	    mknod -m $mode $BUILD_ROOT/dev/$file $arg
+	fi
+    done << DEVLIST
+	mknod null    666 c 1 3
+	mknod zero    666 c 1 5
+	mknod full    666 c 1 7
+	mknod random  666 c 1 8
+	mknod urandom 644 c 1 9
+	mknod tty     666 c 5 0
+	mknod ptmx    666 c 5 2
+	mknod loop-control 600 c 10 237
+	mknod loop0   640 b 7 0
+	mknod loop1   640 b 7 1
+	mknod loop2   640 b 7 2
+	mknod loop3   640 b 7 3
+	mknod fuse    666 c 10 229
+	ln    fd      777 /proc/self/fd
+	ln    stdin   777 fd/0
+	ln    stdout  777 fd/1
+	ln    stderr  777 fd/2
+DEVLIST
+}
+
+# check whether the repo list contains a plain "zypp://". Add all
+# enabled zypp repos in this case
+expand_plain_zypp_repo() {
+    local i j
+    r=()
+    for i in "${repos[@]}"; do
+	if test "$i" = "zypp://" ; then
+	    for j in $($BUILD_DIR/createzyppdeps --listrepos) ; do
+		r=("${r[@]}" "zypp://$j")
+	    done
+	else
+	    r=("${r[@]}" "$i")
+	fi
+    done
+    repos=("${r[@]}")
+}
+
+create_cache_file() {
+    local findonly=
+    expand_plain_zypp_repo
+
+    # check if we can reuse the old cache file
+    if ! test -f $CACHE_FILE || ! test -f $CACHE_FILE.id || \
+	test "${repos[*]} ${BUILD_RPMS//:/ /}" != "$(cat $CACHE_FILE.id 2>/dev/null)"; then
+	rm -f $CACHE_FILE.id
+    else
+	for SRC in "${repos[@]}" ${BUILD_RPMS//:/ /}; do
+	    test -n "$SRC" || SRC=.
+	    if test "${SRC#zypp://}" != "$SRC" ; then
+		SRC="/var/cache/zypp/raw/${SRC#zypp://}"
+	    fi
+	    if test "$SRC" -nt $CACHE_FILE; then
+		rm -f $CACHE_FILE.id
+		break
+	    fi
+	    # always rebuild if we have remote repositories and --clean is given
+	    if test -n "$CLEAN_BUILD" -a "$SRC" != "${SRC#*://}" -a "${SRC#zypp://}" = "$SRC" ; then
+		rm -f $CACHE_FILE.id
+		break
+	    fi
+	done
+    fi
+    if test -f $CACHE_FILE.id ; then
+	return
+    fi
+
+    # nope, generate a new cache file
+    test -z "$LIST_STATE" && echo initializing $CACHE_FILE ...
+
+    # figure out a repository type default
+    REPOTYPE=
+    if test -n "$BUILD_DIST" ; then
+	for i in `queryconfig repotype --dist "$BUILD_DIST" --configdir "$CONFIG_DIR" --archpath "$BUILD_ARCH"` ; do
+	    case $i in
+		arch|debian|hdlist2|rpm-md) REPOTYPE=$i ;;
+	    esac
+	    test -n "$REPOTYPE" && break
+	done
+	if test -z "$REPOTYPE"; then
+	    BINTYPE=`queryconfig binarytype --dist "$BUILD_DIST" --configdir "$CONFIG_DIR" --archpath "$BUILD_ARCH"`
+	    case "$BINTYPE" in
+		arch) REPOTYPE=arch ;;
+		deb)  REPOTYPE=debian ;;
+	    esac
+	fi
+    fi
+    if test -z "$REPOTYPE" ; then
+	# check the first init_buildsystem arg, maybe it is a recipe
+	case ${PKGS[0]} in
+	    *.spec)
+		REPOTYPE=rpm-md ;;
+	    *.dsc)
+		REPOTYPE=debian ;;
+	    */PKGBUILD|PKGBUILD|*/_service:*:PKGBUILD|_service:*:PKGBUILD)
+		REPOTYPE=arch ;;
+	esac
+    fi
+    for SRC in "${repos[@]}" -- ${BUILD_RPMS//:/ /}; do
+	if test "$SRC" = '--' ; then
+	    findonly=1
+	    continue
+	fi
+	SRCREPOTYPE=$REPOTYPE
+	case $SRC in
+	    arch@* | debian@* | hdlist2@* | rpmmd@* | rpm-md@* | suse@*)
+		SRCREPOTYPE=${SRC%%@*}
+		SRC=${SRC#*@}
+		;;
+	esac
+	test -z "$SRC" && SRC=`pwd`
+	if test "${SRC#http://}" != "$SRC" -o "${SRC#https://}" != "$SRC" -o "${SRC#ftp://}" != "$SRC" -o "${SRC#ftps://}" != "$SRC" ; then
+	    # remote repo, cache binary packages
+	    mkdir -p "$(getcachedir "$SRC")"
+	    if test "$SRCREPOTYPE" = arch ; then
+		set -- $BUILD_DIR/createarchdeps --cachedir="$CACHE_DIR" "$SRC"
+	    elif test "$SRCREPOTYPE" = debian ; then
+		set -- $BUILD_DIR/createdebdeps --cachedir="$CACHE_DIR" --archpath "$BUILD_ARCH" "$SRC"
+	    elif test "$SRCREPOTYPE" = suse ; then
+		set -- $BUILD_DIR/createyastdeps --cachedir="$CACHE_DIR" "$SRC"
+	    elif test "$SRCREPOTYPE" = hdlist2 ; then
+		set -- $BUILD_DIR/createmdkdeps --cachedir="$CACHE_DIR" "$SRC"
+	    else
+		set -- $BUILD_DIR/createrepomddeps --cachedir="$CACHE_DIR" "$SRC"
+	    fi
+	elif test "${SRC#zypp://}" != "$SRC" ; then
+	    # special zypp repo
+	    set -- $BUILD_DIR/createzyppdeps --cachedir="$CACHE_DIR" "$SRC"
+	elif test ! -e "$SRC" ; then
+	    cleanup_and_exit 1 "*** $SRC does not exist"
+	elif test -z "$findonly" -a \( -e "$SRC"/suse/setup/descr/packages -o -e "$SRC"/suse/setup/descr/packages.gz \) ; then
+	    set -- $BUILD_DIR/createyastdeps "$SRC"
+	elif test -z "$findonly" -a -e "$SRC"/repodata/repomd.xml ; then
+	    set -- $BUILD_DIR/createrepomddeps "$SRC"
+	else
+	    set -- $BUILD_DIR/createdirdeps --oldfile "$CACHE_FILE" "$SRC"
+	fi
+	echo "$@" >&2
+	"$@" || cleanup_and_exit 1
+	echo D:
+    done > $CACHE_FILE.new
+
+    mv $CACHE_FILE.new $CACHE_FILE
+    echo "${repos[*]} ${BUILD_RPMS//:/ /}" > $CACHE_FILE.id
+}
+
+fail_exit() {
+    cleanup_and_exit 1
+}
+
+# modifies $SRC
+downloadpkg() {
+    local url="$1"
+
+    case $url in 
+	zypp://* | http://* | https://* | ftp://* | ftps://*) ;;
+	*) cleanup_and_exit 1 "Invalid url: $url" ;;
+    esac
+
+    local cachedir="$(getcachedir "$url")"
+    local name="$(basename "$url")"
+    name=${name/%.pkg.tar.zst/.arch}
+    name=${name/%.pkg.tar.?z/.arch}
+    SRC="$cachedir/$name"
+    local destdir="$cachedir/tmp"
+    mkdir -p "$destdir"
+    echo "downloading $url ... ";
+    $BUILD_DIR/download "$destdir" "$url" || cleanup_and_exit 1
+    local destfile="$destdir/${url##*/}"
+    if test ! -e "$destfile" ; then
+	cleanup_and_exit 1 "expected $destfile after download but it's missing"
+    fi
+    # for rpm check integrity and the signature
+    case $destfile in
+      *.rpm)
+	rpm -K $DLNOSIGNATURE "$destfile" > $destfile.v || { echo "rpm verify failed" >&2; rm -rf "$destdir"; cleanup_and_exit 1; }
+	if grep "NOT OK" $destfile.v; then
+	    rm -rf "$destdir"
+	    cleanup_and_exit 1
+	fi
+	rm -f "$destfile.v"
+	;;
+    esac
+    mv "$destfile" "$SRC" || cleanup_and_exit 1
+}
+
+getcachedir() {
+    local url=$1
+    for repo in "${repos[@]}" ; do
+	case $repo in
+	    arch@* | debian@* | hdlist2@* | rpmmd@* | rpm-md@* | suse@*) repo=${repo#*@} ;;
+	esac
+	if test "${url:0:${#repo}}" == "$repo" ; then
+	    read repoid dummy < <(echo -n "$repo" | md5sum)
+	    echo "$CACHE_DIR/$repoid"
+	    break
+	fi
+    done
+}
+
+set_build_arch
+
+trap fail_exit EXIT
+
+if test "$BUILD_ROOT" = / ; then
+    browner="$(stat -c %u /)"
+fi
+
+if test -n "$CLEAN_BUILD" ; then
+    clean_build_root
+fi
+
+#
+# now test if there was an incomplete run
+#
+if test -e "$BUILD_IS_RUNNING" ; then
+    echo "It seems that there was an incomplete setup of $BUILD_ROOT."
+    if test -z "$BUILD_ROOT" -o "$BUILD_ROOT" = / ; then
+	    cleanup_and_exit 1
+    fi
+    echo "To be sure, we will build it again completely..."
+    umount_stuff
+    echo "Your build system is broken!! Shall I execute"
+    echo
+    echo "    rm -rf -- $BUILD_ROOT/*"
+    echo
+    echo "y - yes, cleanup the build root"
+    echo "N - No, abort build (default on enter)"
+    echo "c - Continue anyway with this build root"
+    echo -n "[y/N/c] "
+    read ANSWER
+    case "$ANSWER" in
+	c|C)
+	    rm -f $BUILD_IS_RUNNING $BUILD_ROOT/exit ;;
+	y|Y)
+	    clean_build_root ;;
+	*)
+	    cleanup_and_exit 1 ;;
+    esac
+fi
+
+# check for surprises
+if test -z "$CLEAN_BUILD" -a -n "$BUILD_ROOT" -a "$BUILD_ROOT" != / ; then
+    assert_dirs
+fi
+# umount stuff if mounted
+if test -n "$BUILD_ROOT" -a "$BUILD_ROOT" != / -a -e "$BUILD_ROOT/proc/self" ; then
+    umount_stuff
+fi
+
+#
+# store that we start to build the system
+#
+mkdir -p "$BUILD_ROOT"
+mkdir -p "$BUILD_ROOT/.build"
+mkdir -p "$BUILD_ROOT/proc"
+mkdir -p "$BUILD_ROOT/dev/pts"
+touch $BUILD_IS_RUNNING
+
+if test -n "$PREPARE_VM" ; then
+    rm -rf $BUILD_ROOT/.build/init_buildsystem.data
+fi
+
+if test -e $BUILD_ROOT/.build/init_buildsystem.data ; then
+    # vm continuation, read old config
+    . $BUILD_ROOT/.build/init_buildsystem.data
+else
+    #
+    # now make sure that all the packages are installed.
+    #
+    rm -rf "$BUILD_ROOT/.init_b_cache"
+    mkdir -p "$BUILD_ROOT/.init_b_cache/scripts"
+
+    if test -z "$RPMLIST" ; then
+	#
+	# create rpmdeps file
+	#
+	CACHE_FILE=$BUILD_ROOT/.srcfiles.cache
+	create_cache_file
+
+	#
+	# select and expand packages
+	#
+	RPMLIST=$BUILD_ROOT/.init_b_cache/rpmlist
+	test -z "$LIST_STATE" && echo "expanding package dependencies..."
+	VMOPT=
+	test -z "$PREPARE_VM" || VMOPT=--vm
+	if ! $BUILD_DIR/expanddeps $USEUSEDFORBUILD $VMOPT "${definesnstuff[@]}" --dist "$BUILD_DIST" --depfile "$CACHE_FILE" --archpath "$BUILD_ARCH" --configdir $CONFIG_DIR "${PKGS[@]}" > $RPMLIST ; then
+	    rm -f $BUILD_IS_RUNNING
+	    cleanup_and_exit 1
+	fi
+    fi
+
+    if test -n "$LIST_STATE" ; then
+	rm -f $BUILD_IS_RUNNING
+	while read PKG SRC ; do
+	   test "$PKG" = "preinstall:" && continue
+	   test "$PKG" = "runscripts:" && continue
+	   test "$PKG" = "cbpreinstall:" && continue
+	   test "$PKG" = "vminstall:" && continue
+	   test "$PKG" = "dist:" && continue
+	   test "$PKG" = "rpmid:" && continue
+	   echo "${SRC##*/}"
+	done < $BUILD_ROOT/.init_b_cache/rpmlist
+	rm -rf "$BUILD_ROOT/.init_b_cache"
+	cleanup_and_exit 0
+    fi
+
+    #
+    # register the QEMU emulator if needed
+    # (we do not need this for the prepare step, as we do not run scripts in this case)
+    #
+    if test -z "$PREPARE_VM" ; then
+	if check_use_emulator ; then
+	    echo "registering binfmt handlers for cross build"
+	    "$BUILD_DIR/$INITVM_NAME"
+	    echo 0 > /proc/sys/vm/mmap_min_addr
+	    read mmap_min_addr < /proc/sys/vm/mmap_min_addr
+	    if test "$mmap_min_addr" != 0 ; then
+		echo "Warning: mmap_min_addr is != 0. If programs fail at mmap this could be the reason."
+	    fi
+	fi
+    fi
+
+    #
+    # extract the data from the (generated) rpm list
+    #
+    PACKAGES_TO_INSTALL=
+    PACKAGES_TO_PREINSTALL=
+    PACKAGES_TO_RUNSCRIPTS=
+    PACKAGES_TO_VMINSTALL=
+    PACKAGES_TO_INSTALLONLY=
+    PACKAGES_TO_NOINSTALL=
+    PREINSTALL_IMAGE=
+    PREINSTALL_IMAGE_SOURCE=
+    RUNSCRIPTS_SEEN=
+    PACKAGES_FROM_PREINSTALLIMAGE=
+    GUESSED_DIST=unknown
+    mkdir -p $BUILD_ROOT/.init_b_cache/rpms
+    rm -f $BUILD_ROOT/.init_b_cache/rpmlist.download
+    while read PKG SRC ; do
+	if test "$PKG" = "preinstall:" ; then
+	    PACKAGES_TO_PREINSTALL=$SRC
+	    continue
+	fi
+	if test "$PKG" = "vminstall:" ; then
+	    PACKAGES_TO_VMINSTALL=$SRC
+	    continue
+	fi
+	if test "$PKG" = "installonly:" ; then
+	    PACKAGES_TO_INSTALLONLY=$SRC
+	    continue
+	fi
+	if test "$PKG" = "noinstall:" ; then
+	    PACKAGES_TO_NOINSTALL=$SRC
+	    continue
+	fi
+	if test "$PKG" = "preinstallimage:" ; then
+	    PREINSTALL_IMAGE=${SRC##*/}
+	    ln -s "$SRC" "$BUILD_ROOT/.init_b_cache/rpms/${SRC##*/}"
+	    continue
+	fi
+	if test "$PKG" = "preinstallimagesource:" ; then
+	    PREINSTALL_IMAGE_SOURCE="$SRC"
+	    continue
+	fi
+	if test "$PKG" = "runscripts:" ; then
+	    RUNSCRIPTS_SEEN=true
+	    PACKAGES_TO_RUNSCRIPTS=$SRC
+	    continue
+	fi
+	if test "$PKG" = "dist:" ; then
+	    GUESSED_DIST=$SRC
+	    continue
+	fi
+	if test "$PKG" = "rpmid:" ; then
+	    echo "${SRC#*:}" > $BUILD_ROOT/.init_b_cache/rpms/${SRC%%:*}.id
+	    continue
+	fi
+	if test "$PKG" != "${PKG%:}"; then
+	    echo "Warning: ignoring unsupported tag '$PKG'" >&2
+	    continue
+	fi
+	if test "$SRC" = "preinstallimage" ; then
+	    PACKAGES_FROM_PREINSTALLIMAGE="$PACKAGES_FROM_PREINSTALLIMAGE $PKG"
+	    PACKAGES_TO_INSTALL="$PACKAGES_TO_INSTALL $PKG"
+	    continue
+	fi
+	PACKAGES_TO_INSTALL="$PACKAGES_TO_INSTALL $PKG"
+	if test "${SRC#/}" = "$SRC" ; then
+	    case "$SRC" in
+		zypp://* | http://* | https://* | ftp://* | ftps://*)
+		    echo "$PKG $SRC" >>$BUILD_ROOT/.init_b_cache/rpmlist.download
+		    continue
+		    ;;
+		*)
+		    cleanup_and_exit 1 "unsupported url for '$PKG': $SRC"
+		    ;;
+	    esac
+	fi
+	SRCSUF=${SRC/%.pkg.tar.zst/.arch}
+	SRCSUF=${SRCSUF/%.pkg.tar.?z/.arch}
+	ln -s "$SRC" "$BUILD_ROOT/.init_b_cache/rpms/$PKG.${SRCSUF##*.}"
+    done < $RPMLIST
+
+    PACKAGES_TO_ALL="$PACKAGES_TO_INSTALL"
+    PACKAGES_TO_AVAILABLE="$PACKAGES_TO_INSTALL"
+
+    # subtract noinstall packages from PACKAGES_TO_INSTALL
+    if test -n "$PACKAGES_TO_NOINSTALL" ; then
+        settest=" $PACKAGES_TO_NOINSTALL "
+	PACKAGES_TO_INSTALL=
+	for PKG in $PACKAGES_TO_ALL ; do
+	    test "$settest" = "${settest/ $PKG /}" && PACKAGES_TO_INSTALL="$PACKAGES_TO_INSTALL $PKG"
+	done
+    fi
+    # subtract installonly packages from PACKAGES_TO_AVAILABLE
+    if test -n "$PACKAGES_TO_INSTALLONLY" ; then
+        settest=" $PACKAGES_TO_INSTALLONLY "
+	PACKAGES_TO_AVAILABLE=
+	for PKG in $PACKAGES_TO_ALL ; do
+	    test "$settest" = "${settest/ $PKG /}" && PACKAGES_TO_AVAILABLE="$PACKAGES_TO_AVAILABLE $PKG"
+	done
+    fi
+
+    # use cached packages where possible
+    if test -s $BUILD_ROOT/.init_b_cache/rpmlist.download ; then
+	echo "calculating packages to download..."
+        while read PKG SRC ; do
+	    SRCSUF=${SRC/%.pkg.tar.zst/.arch}
+	    SRCSUF=${SRCSUF/%.pkg.tar.?z/.arch}
+	    if test -s "$BUILD_ROOT/.init_b_cache/rpms/$PKG.id" ; then
+		read cachepkgid < $BUILD_ROOT/.init_b_cache/rpms/$PKG.id
+		echo "PKG $PKG $cachepkgid"
+	    else
+		echo "PKG $PKG"
+	    fi
+	    echo "DST $BUILD_ROOT/.init_b_cache/rpms/$PKG.${SRCSUF##*.}"
+	    if test "$SRC" != "${SRC#zypp://}" ; then
+		# for zypp packages also look in the zypp cache
+		cachedir="/var/cache/zypp/packages/${SRC#zypp://}"
+		echo "CACHE ${cachedir%/*}/${SRC##*/}"
+	    fi
+	    cachedir="$(getcachedir "$SRC")"
+	    echo "CACHE $cachedir/${SRCSUF##*/}"
+	done < $BUILD_ROOT/.init_b_cache/rpmlist.download | "$BUILD_DIR/getbuildids" cachecheck
+        # remove found packages from download list
+        rm -f $BUILD_ROOT/.init_b_cache/rpmlist.download2
+        while read PKG SRC ; do
+	    SRCSUF=${SRC/%.pkg.tar.zst/.arch}
+	    SRCSUF=${SRCSUF/%.pkg.tar.?z/.arch}
+	    test -L "$BUILD_ROOT/.init_b_cache/rpms/$PKG.${SRCSUF##*.}" || echo "$PKG $SRC" >>$BUILD_ROOT/.init_b_cache/rpmlist.download2
+	done < $BUILD_ROOT/.init_b_cache/rpmlist.download
+        rm -f $BUILD_ROOT/.init_b_cache/rpmlist.download
+	test -s $BUILD_ROOT/.init_b_cache/rpmlist.download2 && mv $BUILD_ROOT/.init_b_cache/rpmlist.download2 $BUILD_ROOT/.init_b_cache/rpmlist.download
+    fi
+
+    # now do the download of missing packages
+    if test -s $BUILD_ROOT/.init_b_cache/rpmlist.download ; then
+        PACKAGES_TO_DOWNLOAD=`awk '{print $2}' < "$BUILD_ROOT/.init_b_cache/rpmlist.download"`
+        progress_setup PACKAGES_TO_DOWNLOAD
+        while read PKG SRC ; do
+            progress_step PACKAGES_TO_DOWNLOAD
+            downloadpkg "$SRC"
+	    # downloadpkg modified $SRC, so it has a right name for use
+	    SRCSUF=${SRC/%.pkg.tar.zst/.arch}
+	    SRCSUF=${SRCSUF/%.pkg.tar.?z/.arch}
+	    ln -s "$SRC" "$BUILD_ROOT/.init_b_cache/rpms/$PKG.${SRCSUF##*.}"
+        done < $BUILD_ROOT/.init_b_cache/rpmlist.download
+        rm -f $BUILD_ROOT/.init_b_cache/rpmlist.download
+        echo
+    fi
+
+    # compatibility...
+    test -z "$RUNSCRIPTS_SEEN" && PACKAGES_TO_RUNSCRIPTS="$PACKAGES_TO_PREINSTALL"
+
+    buildroot_rm .guessed_dist
+    echo "$GUESSED_DIST" > $BUILD_ROOT/.guessed_dist
+    test -n "$BUILD_DIST" || BUILD_DIST="$GUESSED_DIST"
+
+    pkg_set_type
+
+    if test -n "$PREINSTALL_IMAGE" ; then
+	for PKG in $PACKAGES_FROM_PREINSTALLIMAGE ; do
+	    # touch the file so that the copying works
+	    touch $BUILD_ROOT/.init_b_cache/rpms/"$PKG.$PSUF"
+	done
+    fi
+
+fi
+
+# XXX: should use an option instead of looking at the recipe?
+CREATE_PREINSTALL_DATA=
+case ${PKGS[0]} in
+  _preinstallimage | */_preinstallimage | _service:*:_preinstallimage | */_service:*:_preinstallimage)
+    mkdir -p $BUILD_ROOT/.preinstall_image
+    CREATE_PREINSTALL_DATA=true
+    echo "saving package data for preinstallimage generation"
+    ;;
+esac
+  
+#
+# test if we need to preinstall
+#
+if test ! -e $BUILD_ROOT/installed-pkg -a ! -e $BUILD_ROOT/.build/init_buildsystem.data ; then
+    mkdir -p $BUILD_ROOT/.init_b_cache/rpms || cleanup_and_exit 1
+    mkdir -p $BUILD_ROOT/etc || cleanup_and_exit 1
+    mkdir -p $BUILD_ROOT/proc || cleanup_and_exit 1
+    test -L $BUILD_ROOT/etc/HOSTNAME && buildroot_rm etc/HOSTNAME
+    test -f $BUILD_ROOT/etc/HOSTNAME || hostname -f > $BUILD_ROOT/etc/HOSTNAME
+    for PKG in $PACKAGES_TO_RUNSCRIPTS ; do
+	: > $BUILD_ROOT/.init_b_cache/scripts/$PKG.run
+    done
+    PACKAGES_TO_PREINSTALL_FILTERED="$PACKAGES_TO_PREINSTALL"
+    PACKAGES_TO_VMINSTALL_FILTERED="$PACKAGES_TO_VMINSTALL"
+    rm -f "$BUILD_ROOT/.preinstall_image"/*
+    if test -n "$PREINSTALL_IMAGE" ; then
+	preinstall_image "$PREINSTALL_IMAGE" "$PREINSTALL_IMAGE_SOURCE"
+	PACKAGES_TO_PREINSTALL_FILTERED=`preinstall_image_filter $PACKAGES_TO_PREINSTALL_FILTERED`
+	PACKAGES_TO_VMINSTALL_FILTERED=`preinstall_image_filter $PACKAGES_TO_VMINSTALL_FILTERED`
+    fi
+    PACKAGES_TO_PREINSTALL_FILTERED=`reorder $PACKAGES_TO_PREINSTALL_FILTERED`
+    if test -n "$PREPARE_VM" ; then
+        PACKAGES_TO_VMINSTALL_FILTERED=`reorder $PACKAGES_TO_VMINSTALL_FILTERED`
+    fi
+    progress_setup PACKAGES_TO_PREINSTALL_FILTERED
+    for PKG in $PACKAGES_TO_PREINSTALL_FILTERED ; do
+	progress_step PACKAGES_TO_PREINSTALL_FILTERED
+	preinstall ${PKG##*/}
+    done
+    if test -n "$PREPARE_VM" ; then
+	echo
+	progress_setup PACKAGES_TO_VMINSTALL_FILTERED
+	for PKG in $PACKAGES_TO_VMINSTALL_FILTERED ; do
+	    progress_step PACKAGES_TO_VMINSTALL_FILTERED
+	    preinstall ${PKG##*/}
+	done
+    fi
+    # for reorder
+    check_exit
+    if test -w /root ; then
+	test -c $BUILD_ROOT/dev/null || create_devs
+    fi
+    if ! test -e $BUILD_ROOT/etc/fstab ; then
+	rm -rf $BUILD_ROOT/etc/fstab
+	touch $BUILD_ROOT/etc/fstab
+    fi
+    if test ! -e $BUILD_ROOT/etc/ld.so.conf -a -f $BUILD_ROOT/etc/ld.so.conf.in -a ! -L $BUILD_ROOT/etc/ld.so.conf.in ; then
+	rm -rf $BUILD_ROOT/etc/ld.so.conf
+	cp $BUILD_ROOT/etc/ld.so.conf.in $BUILD_ROOT/etc/ld.so.conf
+    fi
+    if test -z "$PREPARE_VM" ; then
+	mount_stuff
+	run_pkg_scripts
+	pkg_initdb
+	touch $BUILD_ROOT/.init_b_cache/preinstall_finished
+    fi
+    # mark as preinstalled no longer needed
+    rm -rf "$BUILD_ROOT/installed-pkg"
+    mkdir -p "$BUILD_ROOT/installed-pkg"
+else
+    # preinstall was already done
+    if test -z "$PREPARE_VM" ; then
+	mount_stuff
+    fi
+fi
+
+if test -n "$PREPARE_VM" ; then
+    echo "copying packages..."
+    for PKG in $PACKAGES_TO_ALL ; do
+	rm -rf $BUILD_ROOT/.init_b_cache/$PKG.$PSUF
+	cp $BUILD_ROOT/.init_b_cache/rpms/$PKG.$PSUF $BUILD_ROOT/.init_b_cache/$PKG.$PSUF || cleanup_and_exit 1
+	ln -s -f ../$PKG.$PSUF $BUILD_ROOT/.init_b_cache/rpms/$PKG.$PSUF
+	check_exit
+    done
+    # alreadyinstalled check will not work, but we have to live with that...
+    echo -n 'reordering...'
+    PACKAGES_TO_INSTALL=`reorder $PACKAGES_TO_INSTALL`
+    check_exit
+    echo 'done'
+    Q="'\''"
+    rm -rf "$BUILD_ROOT/.build/init_buildsystem.data"
+    echo "PACKAGES_TO_INSTALL='${PACKAGES_TO_INSTALL//"'"/$Q}'" > $BUILD_ROOT/.build/init_buildsystem.data
+    echo "PACKAGES_TO_RUNSCRIPTS='${PACKAGES_TO_RUNSCRIPTS//"'"/$Q}'" >> $BUILD_ROOT/.build/init_buildsystem.data
+    # needed for continuation in xen/kvm with rpm-x86
+    echo "PACKAGES_TO_PREINSTALL='${PACKAGES_TO_PREINSTALL//"'"/$Q}'" >> $BUILD_ROOT/.build/init_buildsystem.data
+    echo "PACKAGES_TO_AVAILABLE='${PACKAGES_TO_AVAILABLE//"'"/$Q}'" >> $BUILD_ROOT/.build/init_buildsystem.data
+    echo "PSUF='$PSUF'" >> $BUILD_ROOT/.build/init_buildsystem.data
+    rm -f $BUILD_IS_RUNNING
+    cleanup_and_exit 0
+fi
+
+#
+# finish preinstall if this is a vm continuation
+#
+if test -e "$BUILD_ROOT/.build/init_buildsystem.data" -a ! -e "$BUILD_ROOT/.init_b_cache/preinstall_finished" ; then
+    run_pkg_scripts
+    pkg_initdb
+    touch "$BUILD_ROOT/.init_b_cache/preinstall_finished"
+fi
+
+#
+# create .build.binaries directory if requested
+#
+rm -rf "$BUILD_ROOT/.build.binaries"
+if test -n "$CREATE_BUILD_BINARIES" ; then
+    echo "creating .build.binaries directory..."
+    mkdir -p "$BUILD_ROOT/.build.binaries"
+    for PKG in $PACKAGES_TO_AVAILABLE ; do
+	test -L "$BUILD_ROOT/.init_b_cache/rpms/$PKG.$PSUF" || continue
+	LPKG=`readlink -f "$BUILD_ROOT/.init_b_cache/rpms/$PKG.$PSUF"`
+	ln "$LPKG" "$BUILD_ROOT/.build.binaries/$PKG.$PSUF" 2>/dev/null
+	test -f "$BUILD_ROOT/.build.binaries/$PKG.$PSUF" && continue
+	cp "$LPKG" "$BUILD_ROOT/.build.binaries/$PKG.$PSUF"
+	check_exit
+    done
+fi
+
+#
+# Save some package build environment preparation time on Debian-like systems
+# Note: for OS image builds we probably want the man-db constructed properly
+#
+if test -x "$BUILD_ROOT/usr/bin/debconf-set-selections" && test "$BUILDTYPE" = dsc ; then
+    echo "Preseed man-db/auto-update to false for a DSC package build..."
+    chroot "$BUILD_ROOT" /usr/bin/debconf-set-selections <<EOF
+man-db man-db/auto-update boolean false
+EOF
+fi
+
+#
+# reorder packages (already done in vm continuation)
+#
+if ! test -e $BUILD_ROOT/.build/init_buildsystem.data ; then
+    echo -n 'reordering...'
+    PACKAGES_TO_INSTALL=`reorder $PACKAGES_TO_INSTALL`
+    check_exit
+    echo 'done'
+fi
+
+echo "querying package ids..."
+for PKG in $PACKAGES_TO_INSTALL ; do
+    test -s "$BUILD_ROOT/.init_b_cache/rpms/$PKG.$PSUF" || continue
+    test -L "$BUILD_ROOT/.init_b_cache/rpms/$PKG.$PSUF" || continue
+    echo "$BUILD_ROOT/.init_b_cache/rpms/$PKG.$PSUF"
+done | "$BUILD_DIR/getbuildids" 
+
+#
+# get list and ids of already installed packages
+#
+mkdir -p $BUILD_ROOT/.init_b_cache/alreadyinstalled
+listinstalled --root "$BUILD_ROOT" --type "$PSUF" --extraname | (
+    while read id name buildid; do
+	echo "$buildid" > "$BUILD_ROOT/.init_b_cache/alreadyinstalled/$name"
+    done
+)
+
+# do pre-installation work
+pkg_prepare
+
+#
+# delete all packages we don't want
+#
+mkdir -p $BUILD_ROOT/.init_b_cache/todelete
+for PKG in $BUILD_ROOT/.init_b_cache/alreadyinstalled/* ; do
+    PKG=${PKG##*/}
+    test "$PKG" = "*" && continue
+    ln $BUILD_ROOT/.init_b_cache/alreadyinstalled/$PKG $BUILD_ROOT/.init_b_cache/todelete/$PKG
+done
+for PKG in $PACKAGES_TO_INSTALL; do
+    rm -f $BUILD_ROOT/.init_b_cache/todelete/$PKG
+done
+for PKG in $BUILD_ROOT/.init_b_cache/todelete/* ; do
+    PKG=${PKG##*/}
+    test "$PKG" = "*" && continue
+    echo "deleting $PKG"
+    pkg_erase
+    check_exit
+done
+rm -rf "$BUILD_ROOT/.init_b_cache/todelete"
+
+rm -rf "$BUILD_ROOT/.init_b_cache/preinstalls"
+mkdir -p "$BUILD_ROOT/.init_b_cache/preinstalls"
+for PKG in $PACKAGES_TO_PREINSTALL; do
+    touch "$BUILD_ROOT/.init_b_cache/preinstalls/$PKG"
+done
+
+rm -rf "$BUILD_ROOT/installed-pkg"
+mkdir -p "$BUILD_ROOT/installed-pkg"
+
+test -x $BUILD_ROOT/sbin/ldconfig && chroot $BUILD_ROOT /sbin/ldconfig 2>&1
+
+MAIN_LIST="$PACKAGES_TO_INSTALL"
+progress_setup MAIN_LIST
+for PKG in $MAIN_LIST ; do
+    test -f $BUILD_ROOT/installed-pkg/$PKG && continue
+    progress_step MAIN_LIST
+
+    if test -e "$BUILD_ROOT/.init_b_cache/rpms/$PKG.$PSUF" -a ! -s "$BUILD_ROOT/.init_b_cache/rpms/$PKG.$PSUF" ; then
+	# preinstallimage package, make sure it's in the image
+	if ! test -e $BUILD_ROOT/.preinstall_image/$PKG ; then
+	    cleanup_and_exit 1 "Package $PKG is missing from the preinstall image"
+	fi
+	read PKG_HDRMD5 PKGID < $BUILD_ROOT/.preinstall_image/$PKG
+	echo "preinstalled ${PKGID%% *}"
+	echo "$PKGID" > $BUILD_ROOT/installed-pkg/$PKG
+	continue
+    fi
+
+    # get the hdrmd5 if we want to create a preinstall image
+    PKG_HDRMD5=
+    if test -n "$CREATE_PREINSTALL_DATA" -a ! -e $BUILD_ROOT/.preinstall_image/$PKG ; then
+	PKG_HDRMD5=`perl -I$BUILD_DIR -MBuild -e 'print Build::queryhdrmd5($ARGV[0])' $BUILD_ROOT/.init_b_cache/rpms/$PKG.$PSUF`
+	test -n "$PKG_HDRMD5" || cleanup_and_exit 1
+    fi
+
+    test -L $BUILD_ROOT/.init_b_cache/rpms/$PKG.$PSUF || continue
+
+    if test -s "$BUILD_ROOT/.init_b_cache/rpms/$PKG.$PSUF.buildid" ; then
+	read PKGID < "$BUILD_ROOT/.init_b_cache/rpms/$PKG.$PSUF.buildid"
+    else
+	PKGID=$(perl -I$BUILD_DIR -MBuild -e Build::showquery "$BUILD_ROOT/.init_b_cache/rpms/$PKG.$PSUF" buildid)
+    fi
+
+    if test -f "$BUILD_ROOT/.init_b_cache/alreadyinstalled/$PKG" ; then
+	read OLDPKGID < "$BUILD_ROOT/.init_b_cache/alreadyinstalled/$PKG"
+	if test "$PKGID" != "$OLDPKGID" && ! test -e "$BUILD_ROOT/.init_b_cache/preinstalls/$PKG" ; then
+	    echo "deleting unwanted ${OLDPKGID%% *}"
+	    pkg_erase
+	else
+	    if test "$VERIFY_BUILD_SYSTEM" != true || pkg_verify_installed ; then
+		echo "keeping ${PKGID%% *}"
+		echo "$PKGID" > $BUILD_ROOT/installed-pkg/$PKG
+		test -n "$PKG_HDRMD5" && echo "$PKG_HDRMD5 $PKGID" > $BUILD_ROOT/.preinstall_image/$PKG
+		continue
+	    fi
+	    echo "deleting incomplete ${OLDPKGID%% *}"
+	    pkg_erase
+	fi
+	if test -e "$BUILD_ROOT/.init_b_cache/preinstalls/$PKG" ; then
+	    preinstall "$PKG"
+	fi
+	check_exit
+    fi
+    
+    if pkg_cumulate ; then
+	echo "cumulate ${PKGID%% *}"
+	continue
+    fi
+    
+    # install the package
+    echo "installing ${PKGID%% *}"
+    if ! test "$BUILD_ROOT/.init_b_cache/rpms/$PKG.$PSUF" -ef "$BUILD_ROOT/.init_b_cache/$PKG.$PSUF" ; then
+	rm -f $BUILD_ROOT/.init_b_cache/$PKG.$PSUF
+	cp $BUILD_ROOT/.init_b_cache/rpms/$PKG.$PSUF $BUILD_ROOT/.init_b_cache/$PKG.$PSUF || cleanup_and_exit 1
+    fi
+    pkg_install
+    check_exit
+    rm -f $BUILD_ROOT/.init_b_cache/$PKG.$PSUF
+    echo "$PKGID" > $BUILD_ROOT/installed-pkg/$PKG
+    test -n "$PKG_HDRMD5" && echo "$PKG_HDRMD5 $PKGID" > $BUILD_ROOT/.preinstall_image/$PKG
+
+done
+
+# do post-installation work
+pkg_finalize
+
+# devices can vanish if devs got uninstalled
+test -c $BUILD_ROOT/dev/null || create_devs
+
+cd $BUILD_ROOT || cleanup_and_exit 1
+
+#
+# setup /etc/mtab
+#
+rm -f $BUILD_ROOT/etc/mtab
+cp /proc/mounts $BUILD_ROOT/etc/mtab
+chmod 644 $BUILD_ROOT/etc/mtab
+
+#
+# make sure that our nis is not present in the chroot system
+#
+if test -e $BUILD_ROOT/etc/nsswitch.conf ; then
+    sed -e "s:nis::g" < $BUILD_ROOT/etc/nsswitch.conf > $BUILD_ROOT/etc/nsswitch.conf.tmp
+    mv $BUILD_ROOT/etc/nsswitch.conf.tmp $BUILD_ROOT/etc/nsswitch.conf
+fi
+
+#
+# create some default directories and files
+#
+for DIR in /usr/share/doc/packages \
+	   /usr/X11R6/include/X11/pixmaps \
+	   /usr/X11R6/include/X11/bitmaps ; do
+    mkdir -p $BUILD_ROOT/$DIR
+done
+for FILE in /var/run/utmp /var/log/wtmp /etc/fstab ; do
+    mkdir -p $BUILD_ROOT/${FILE%/*}
+    touch $BUILD_ROOT/$FILE
+done
+
+echo now finalizing build dir...
+if test -x $BUILD_ROOT/sbin/ldconfig ; then
+	CHROOT_RETURN="`chroot $BUILD_ROOT /sbin/ldconfig 2>&1`"
+	case "$CHROOT_RETURN" in
+	    *warning:*)
+		chroot $BUILD_ROOT /sbin/ldconfig
+		echo
+		echo chroot $BUILD_ROOT /sbin/ldconfig
+		echo
+		echo "$CHROOT_RETURN"
+		echo
+		echo "Problem with ldconfig.  It's better to reinit the build system..."
+		echo
+		cleanup_and_exit 1
+		;;
+	esac
+fi
+
+if test -x $BUILD_ROOT/usr/sbin/Check && ! grep -q "/usr/sbin/Check is obsolete" $BUILD_ROOT/usr/sbin/Check ; then
+    chroot $BUILD_ROOT /usr/sbin/Check
+fi
+
+mkdir -p $BUILD_ROOT/var/adm/packages
+touch $BUILD_ROOT/var/adm/packages
+
+if test -x $BUILD_ROOT/sbin/SuSEconfig ; then
+    if grep norestarts $BUILD_ROOT/sbin/SuSEconfig > /dev/null ; then
+	chroot $BUILD_ROOT /sbin/SuSEconfig --norestarts --force
+    else
+	chroot $BUILD_ROOT /sbin/SuSEconfig --force
+    fi
+fi
+
+if test -x $BUILD_ROOT/usr/X11R6/bin/switch2mesasoft ; then
+    chroot $BUILD_ROOT /usr/X11R6/bin/switch2mesasoft
+fi
+
+for PROG in /usr/bin/TeX/texhash /usr/bin/texhash ; do
+    test -x $BUILD_ROOT/$PROG && \
+	chroot $BUILD_ROOT bash -c ". /etc/profile ; $PROG"
+done
+
+if test -e $BUILD_ROOT/usr/share/zoneinfo/UTC ; then
+    for PROG in /usr/sbin/zic /usr/bin/zic /bin/zic /sbin/zic ; do
+        test -x $BUILD_ROOT/$PROG  && chroot $BUILD_ROOT bash -c "$PROG -l \$(readlink -f /usr/share/zoneinfo/UTC)"
+    done
+fi
+
+if test -d $BUILD_ROOT/usr/lib/build/finalize-system ; then
+    for PROG in $BUILD_ROOT/usr/lib/build/finalize-system/* ; do
+	test -e "$PROG" || continue
+	echo "... running ${PROG##*/}"
+	chroot $BUILD_ROOT "/usr/lib/build/finalize-system/${PROG##*/}" || cleanup_and_exit 1
+    done
+fi
+
+test -e $BUILD_ROOT/.build/init_buildsystem.data || HOST=`hostname`
+test -e $BUILD_ROOT/etc/hosts || echo "127.0.0.1 localhost" > $BUILD_ROOT/etc/hosts
+if ! grep -F "127.0.0.1 $HOST" $BUILD_ROOT/etc/hosts > /dev/null ; then
+    # this makes a reverse lookup on 127.0.0.1 return the host name,
+    # which is bad, but 127.0.0.2 does not work on all unix systems
+    echo "127.0.0.1 $HOST" > $BUILD_ROOT/etc/hosts.new
+    test -f $BUILD_ROOT/etc/hosts && cat $BUILD_ROOT/etc/hosts >> $BUILD_ROOT/etc/hosts.new
+    mv $BUILD_ROOT/etc/hosts.new $BUILD_ROOT/etc/hosts
+fi
+
+rm -f $BUILD_ROOT/.rpmmacros $BUILD_ROOT/root/.rpmmacros
+rm -rf "$BUILD_ROOT/.init_b_cache"
+rm -f $BUILD_IS_RUNNING
+rm -f $TMPFILE
+
+cleanup_and_exit 0
+
+# vim: set tabstop=8 softtabstop=4 shiftwidth=4 noexpandtab:

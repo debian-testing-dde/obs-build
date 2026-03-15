@@ -1,0 +1,144 @@
+#################################################################
+#
+# Fissile specific functions.
+#
+# Author: Tim Hardeck (thardeck@suse.de), Dimitris Karakasilis (dkarakasilis@suse.com)
+#
+################################################################
+#
+# Copyright (c) 2017 SUSE Linux Products GmbH
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License version 2 or 3 as
+# published by the Free Software Foundation.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program (see the file COPYING); if not, write to the
+# Free Software Foundation, Inc.,
+# 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA
+#
+################################################################
+
+DOCKERD_STARTED=
+
+recipe_setup_fissile() {
+    TOPDIR="/usr/src/packages"
+    mkdir -p "$BUILD_ROOT$TOPDIR/SOURCES"
+    cp -R * $BUILD_ROOT$TOPDIR/SOURCES/
+}
+
+recipe_prepare_fissile() {
+    :
+}
+
+# Variables:
+# $BUILD_ROOT is the chroot
+# $TOPDIR/SOURCES includes the fissile sources
+# $TOPDIR/$DOCKERIMAGE_ROOT where docker will be called
+# $RECIPEFILE equals fissile.yml
+
+recipe_build_fissile() {
+    touch $BUILD_ROOT/etc/resolv.conf
+
+    docker_image_path=$(find containers -regextype egrep -regex ".*\.(tgz|tar|tar\.xz|tar\.gz)$" -print -quit)
+    test -f "$docker_image_path" || cleanup_and_exit 1 "docker image not found"
+
+    if ! $BUILD_DIR/startdockerd --root "$BUILD_ROOT"; then
+	cleanup_and_exit 1
+    fi
+    DOCKERD_STARTED=true
+
+    echo "Loading docker image"
+    if test -L "$docker_image_path" ; then
+	# copy into build root
+	cp -L "$docker_image_path" "$docker_image_path.lnk"
+	mv "$docker_image_path.lnk" "$docker_image_path"
+    fi
+
+    # Inspect the content of the image to decide if this is a layered image
+    # or a filesystem one. We need to know if we will "docker load" it or
+    # "docker import" it.
+    if tar -tf $docker_image_path | grep "^manifest.json" -q; then
+        echo "Layered image found"
+        chroot $BUILD_ROOT docker load --input $TOPDIR/SOURCES/$docker_image_path
+    else
+      # We allow more than one docker image dependencies so we can't map
+      # the tarballs to image names (in fissile.yml). Let it break if the
+      # images are not layered but consider some solution based on the tarball
+      # names (TODO)
+      cleanup_and_exit 1 "Docker images are not layered. No way to map to image name/tags."
+    fi
+  
+    cd $BUILD_ROOT/$TOPDIR/SOURCES
+    # Extract the release directory.
+    if [ -f release.tar.xz ]; then
+	tar -xf release.tar.xz
+    else
+	cleanup_and_exit 1 "Couldn't find the release source tarball. Check your _service file if you use one."
+    fi
+
+    # Move cached bosh tarballs to the directory where fissile will look
+    export FISSILE_CACHE_DIR=/root/.bosh/cache/
+    mkdir -p $BUILD_ROOT$FISSILE_CACHE_DIR
+    find . -maxdepth 1 -regextype posix-egrep -regex '.{40,}' -exec cp -t $BUILD_ROOT$FISSILE_CACHE_DIR {} +
+
+    cd release
+    # Extract cached release ymls to their locations.
+    if [ -f ../yml-cache.tar.gz ]; then
+	tar -xf ../yml-cache.tar.gz
+    fi
+
+    # TODO: Remove this hackery when we use a later runc package (that already provides this symlink)
+    ln -fs /usr/sbin/runc $BUILD_ROOT/usr/bin/docker-runc
+
+    echo "Building packages with fissile"
+    if ! chroot $BUILD_ROOT /bin/bash -c "cd $TOPDIR/SOURCES/release && . .envrc && fissile build packages --docker-network-mode host"; then
+	cleanup_and_exit 1 "fissile build packages failed"
+    fi
+
+    echo "Building images with fissile"
+    if ! chroot $BUILD_ROOT /bin/bash -c "cd $TOPDIR/SOURCES/release && . .envrc && fissile build images"; then
+	cleanup_and_exit 1 "fissile build images failed"
+    fi
+
+    # Save the resulting images to tarballs.
+    mkdir -p $BUILD_ROOT$TOPDIR/FISSILE
+    non_built_images=$(perl -MYAML::XS -e "print join('|', @{YAML::XS::LoadFile('$BUILD_ROOT$TOPDIR/SOURCES/fissile.yml')->{'DockerImageDeps'}})")
+
+    for image in $(chroot $BUILD_ROOT docker images --format "{{.Repository}}:{{.Tag}}" | grep -v $non_built_images); do
+        echo "Saving image $image"
+        filename=$(echo $image | sed 's/\//_/g')
+        if ! chroot $BUILD_ROOT docker save --output "$TOPDIR/FISSILE/$filename.tar" "$image" ; then
+	    cleanup_and_exit 1 "Docker save command failed"
+        fi
+	# Create containerinfo
+	args=()
+	test -n "$DISTURL" && args=("${args[@]}" --disturl "$DISTURL")
+	test -n "$RELEASE" && args=("${args[@]}" --release "$RELEASE")
+	perl -I$BUILD_DIR -MBuild::Docker -e Build::Docker::showcontainerinfo -- "${args[@]}" '' "$filename.tar" "$image" containers/annotation > "$BUILD_ROOT$TOPDIR/FISSILE/$filename.containerinfo"
+    done
+
+    recipe_cleanup_fissile
+
+    BUILD_SUCCEEDED=true
+}
+
+recipe_resultdirs_fissile() {
+    echo FISSILE
+}
+
+recipe_cleanup_fissile() {
+    if test -n "$DOCKERD_STARTED" ; then
+	DOCKERD_STARTED=
+	$BUILD_DIR/startdockerd --root "$BUILD_ROOT" --kill
+    fi
+}
+
+# Local Variables:
+# mode: Shell-script
+# End:

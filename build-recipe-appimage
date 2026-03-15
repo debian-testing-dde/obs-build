@@ -1,0 +1,128 @@
+#################################################################
+#
+# AppImage specific functions.
+#
+# Author: Adrian Schroeter <adrian@suse.de>
+#
+################################################################
+#
+# Copyright (c) 2017 SUSE Linux Products GmbH
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License version 2 or 3 as
+# published by the Free Software Foundation.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program (see the file COPYING); if not, write to the
+# Free Software Foundation, Inc.,
+# 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA
+#
+################################################################
+
+recipe_setup_appimage() {
+    TOPDIR=/usr/src/packages
+    test "$DO_INIT_TOPDIR" = false || rm -rf "$BUILD_ROOT$TOPDIR"
+    for i in OTHER SOURCES APPIMAGE_ROOT ; do
+	mkdir -p "$BUILD_ROOT$TOPDIR/$i"
+    done
+    chown -R "$ABUILD_UID:$ABUILD_GID" "$BUILD_ROOT$TOPDIR"
+    if test "$MYSRCDIR" = $BUILD_ROOT/.build-srcdir ; then
+	mv "$MYSRCDIR"/* $BUILD_ROOT$TOPDIR/SOURCES/
+    else
+	cp -p "$MYSRCDIR"/* $BUILD_ROOT$TOPDIR/SOURCES/
+    fi
+
+    rawcfgmacros=.rpmmacros
+    test "$BUILDTYPE" = debbuild && rawcfgmacros=.debmacros
+    queryconfig rawmacros --dist "$BUILD_DIST" --archpath "$BUILD_ARCH" --configdir "$CONFIG_DIR" > $BUILD_ROOT/root/$rawcfgmacros
+}
+
+recipe_prepare_appimage() {
+    :
+}
+
+# Variables:
+# $BUILD_ROOT is the chroot
+# $TOPDIR/SOURCES includes the appimages sources
+# $TOPDIR/$APPIMAGE_ROOT where appimage will be called
+# $RECIPEFILE the name of the appimage.yml config file
+
+recipe_build_appimage() {
+    local ARCH DEB
+    if [ -x "$BUILD_ROOT/bin/rpm" ]; then
+        ARCH=$(chroot $BUILD_ROOT su -c "rpm --eval '%{_target_cpu}'")
+    else
+        ARCH=$(chroot $BUILD_ROOT su -c "dpkg-architecture -qDEB_BUILD_ARCH")
+        DEB=1
+    fi
+    local DIST="OBS"
+
+    test -z "${ARCH}" -o -z "${DIST}" && cleanup_and_exit 1
+
+    test -d $BUILD_ROOT/.build.binaries || cleanup_and_exit 1 "missing $BUILD_ROOT/.build.binaries"
+
+    if test "$DO_INIT" = true; then
+        if test -n "$DEB" -a ! -d "$BUILD_ROOT/.build.binaries/dists" ; then
+  	    echo "creating debian repository metadata..."
+            createrepo_debian $BUILD_ROOT/.build.binaries ${ARCH} ${DIST}
+            # setup /etc/apt/sources.list
+            mkdir -p "$BUILD_ROOT/etc/apt"
+            echo "deb [trusted=yes] file:/.build.binaries OBS main" >> "$BUILD_ROOT/etc/apt/sources.list"
+        fi
+        if test -z "$DEB" -a ! -d "$BUILD_ROOT/.build.binaries/repodata" ; then
+  	    echo "creating repository metadata..."
+            if chroot "$BUILD_ROOT" test -x /usr/bin/createrepo_c; then
+                chroot "$BUILD_ROOT" /usr/bin/createrepo_c /.build.binaries
+            elif chroot "$BUILD_ROOT" test -x /usr/bin/createrepo; then
+                chroot "$BUILD_ROOT" /usr/bin/createrepo /.build.binaries
+            else
+                cleanup_and_exit 1 "No createrepo found in build root"
+            fi
+        fi
+    fi
+
+    release_option=""
+    if test -n "$RELEASE" ; then
+        release_option="--release $RELEASE"
+    fi
+
+    chroot $BUILD_ROOT su -c "cd $TOPDIR/SOURCES && ARCH=$ARCH /usr/lib/appimagetool/pkg2appimage $release_option" - root \
+	|| cleanup_and_exit 1
+
+    # extract build result basenames
+    local build_results=""
+    for i in $BUILD_ROOT/$TOPDIR/OTHER/* ; do
+	test -f "$i" || continue
+	case "${i##*/}" in
+	    *.AppImage|*.AppImage.digest|*.AppImage.zsync)
+		build_results="${build_results}\n${i%%.snap}"
+		;;
+	    *)
+		;;
+	esac
+    done
+
+    # Fail the build if no build results are found
+    if [ -z "${build_results}" ] ; then
+	cleanup_and_exit 1 "No live-build result found"
+    fi
+
+    BUILD_SUCCEEDED=true
+}
+
+recipe_resultdirs_appimage() {
+    :
+}
+
+recipe_cleanup_appimage() {
+    :
+}
+
+# Local Variables:
+# mode: Shell-script
+# End:

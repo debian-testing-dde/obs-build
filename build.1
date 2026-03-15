@@ -1,0 +1,233 @@
+.de TQ \"follow a TP item with several TQ items to define several
+.      \"entities with one shared description.
+.br
+.ns
+.TP \\$1
+..
+.TH BUILD 1 "(c) 1997-2018 SUSE Linux AG Nuernberg, Germany"
+.SH NAME
+build \- build SUSE Linux RPMs in a chroot environment
+.SH SYNOPSIS
+.B build
+.RB [ --clean | --no-init]
+.RB [ --repo
+.IR dir_or_url ]
+.RB [ --repo ...]
+.RB [ --root
+.IR buildroot ]
+.RB [ recipefile ]
+.br
+.B build
+.B --help
+.br
+.B build
+.B --verify
+.SH DESCRIPTION
+\fBbuild\fR is a tool to build binary packages in a safe and reproducible
+way.
+The default is to build in a chroot sandbox, but \fBbuild\fP also supports
+building in a virtual machine for better security.
+.P
+If a recipe file is specified on the command line,
+.B build
+will use this file and all other files in the directory for building
+the package. If no recipe argument is provided, build will search the
+current directory for a file.
+.P
+The
+.B build
+tool understands the following recipe file types:
+.TP
+.B spec
+A specfile used to generate rpms.
+.TP
+.B src.rpm
+A source rpm, which will be unpacked for the build.
+.TP
+.B kiwi
+A kiwi config file used to generate a kiwi image.
+.TP
+.B dsc
+A dsc file used to generate Debian binary packages.
+.TP
+.B PKGBUILD
+A file used to generate Arch Linux binary packages.
+.TP
+.B build.collax
+A shell script used to generate a Collax binary package.
+.P
+.SH OPTIONS
+.TP
+.B --clean
+Remove the build system and reinitialize it from scratch.
+.TP
+.B --no-init
+Skip the build system initialization and start with build immediately.
+.TP
+.BI "\-\-repo " dir_or_url
+Either a directory containing binary packages (optionally with repository
+metadata), or a url pointing to some remote repository. Multiple
+\fB--repo\fP options can be used so create a specific repository
+layering. Note that packages are searched in the specified repository
+order, i.e. the first repository containing a package with a specific
+name wins regardless of the version.
+As a special form, 'zypp://reponame' can be used to specify
+a system repository. 'zypp://' selects all enabled system
+repositories. This is also the default if BUILD_RPMS is not
+set and no \fB--rpms\fP or \fB--repo\fP option is used.
+.TP
+.BI "\-\-dist " distribution
+Set the distribution. If this option is not given, build tries to
+guess the distribution by looking at the available packages.
+The specified distribution can either be a string
+like "11.2" or "sles9", "debian7", or the pathname of the build
+configuration to use.
+.TP
+.BI "\-\-root " buildroot
+Specifies where the build system is set up. Overrides the
+BUILD_ROOT enviroment variable.
+.TP
+.B --help
+Print a short help text.
+.TP
+.B --norootforbuild
+Force building with user \fRabuild\fP. Otherwise, \fBbuild\fP searches
+the recipe file for a "needsrootforbuild" hint to decide what user
+to use.
+.TP
+.B --list-state
+list packages that would be used to create a fresh build root.
+Does not create the build root or perform a build.
+.TP
+.BI "\-\-rpms " path1 : path2 : path3\fR...\fP
+Where build can find the packages needed to create the
+build system. This option overrides the BUILD_RPMS environment
+variable. This option is deprecated, use \fB--repo\fP instead.
+.TP
+.BI "\-\-arch " arch1 : arch2 : arch3\fR...\fP
+What architectures to select from the RPMs.
+.B build
+automatically sets this to a sensible value for your host if you
+do not specify this option so you should almost never need it.
+
+.SH RPM BUILD SPECIFIC OPTIONS
+.TP
+.B --useusedforbuild
+Tell build not to do dependency expansion, but to extract the
+list of packages to install from "# usedforbuild" lines or, if none
+are found, from all "BuildRequires" lines.  This option is useful
+if you want to re-build a package from a srcrpm with exactly the
+same packages used for the srcrpm build.
+.TP
+.B --stage
+Pass a stage option to rpmbuild. The default is \fB-ba\fP.
+.TP
+.B --target
+Call rpmbuild with a target option. This can be used for cross building.
+.TP
+.B --verify
+Verify the files in an existing build system.
+
+.SH VIRTUAL MACHINE SPECIFIC OPTIONS
+.TP
+.B "--xen --kvm --uml --qemu --emulator --zvm --lxc"
+Sets a specific vm type.
+.TP
+.BI "--vm-type " type
+As above.
+.TP
+.BI "--vm-disk " file
+Specifies the location of the disk image to use. If this option is not
+given, \fIbuildroot\fP\fB.img\fP is used (e.g. /var/tmp/build-root.img).
+.TP
+.BI "--vm-disk-size " size_in_mb
+Specify the size of the disk image to create.
+.TP
+.BI "--vm-disk-filesystem " type
+Sets the filesystem type to use when creating the disk image. The default
+is to use the ext3 filesystem.
+.TP
+.BI "--vm-swap " file
+Specifies the location of the swap file to use. If this option is not
+given, \fIbuildroot\fP\fB.swap\fP is used (e.g. /var/tmp/build-root.swap).
+.TP
+.BI "--vm-swap-size " size_in_mb
+Specify the size of the swap file to create.
+.TP
+.BI "--vm-memory " size_in_mb
+Sets the desired memory size of the virtual machine.
+.TP
+.BI "--vm-kernel " kernel_file
+Set a specific kernel to boot in the virtual machine.
+.TP
+.BI "--vm-initrd " initrd_file
+Set a specific kernel to boot in the virtual machine.
+.TP
+.B --vm-disk-clean
+Force the recreation of the disk image.
+.TP
+.B "--vm-telnet" PORT
+Is forwarding PORT to a telnet session inside of the VM.
+Specify also needed extra packages via -x parameter, usually:
+.I   --vm-telnet 1234 -x telnet-server -x net-tools
+   And connect from the host via:
+.I   telnet localhost 1234
+   NOTE: The telnet server gets started after all packages got installed.
+
+
+.SH RECIPE FILE OPTIONS
+The
+.B build
+command interprets some special control comments in the recipe file:
+.TP
+.B # norootforbuild
+.TQ
+.B # needsrootforbuild
+.B build
+uses either user
+.I root
+or user
+.I abuild
+in the build system to do the build.  For non-SUSE distros as well as
+since SUSE 10.2, the default build user is
+.I abuild.
+For 10.2 and before, the default build user is
+.I root.
+These two flags in the spec file allow to deviate from the defaults
+and force-set the build user to
+.I abuild
+and
+.I root
+.RI "(for " "#\ norootforbuild" " and " "#\ needsrootforbuild" " respectively."
+.TP
+.B # needsbinariesforbuild
+provide the binary rpms that have been used to set up the build root
+in
+.I /.build.binaries
+within the build root.
+.SH ENVIRONMENT
+.TP
+.B BUILD_ROOT
+The directory where build should install the chrooted build system.
+"/var/tmp/build-root" is used by default. See the \fB--root\fP option.
+.TP
+.B BUILD_RPMS
+This can be used instead of the \fB--rpms\fP option. Deprecated.
+.TP
+.B BUILD_RPM_BUILD_STAGE
+The rpm build stage (-ba, -bb, ...).  This is just passed through to
+rpm, check the rpm manpage for a complete list and descriptions.
+"-ba" is the default. You should probably use the \fB--stage\fP
+option instead.
+
+.SH SEE ALSO
+.BR rpm (8), dpkg (8), pacman (8), kiwi (8)
+.TP
+.BR "Maximum RPM":
+.I http://www.rpm.org/max-rpm/
+.TP
+.BR "cross distribution packaging":
+.I http://en.opensuse.org/openSUSE:Build_Service_cross_distribution_howto
+.TP
+.BR "openSUSE packaging standards and guidelines":
+.I http://en.opensuse.org/Portal:Packaging

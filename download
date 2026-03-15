@@ -1,0 +1,79 @@
+#!/usr/bin/perl -w
+
+################################################################
+#
+# Copyright (c) 1995-2014 SUSE Linux Products GmbH
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License version 2 or 3 as
+# published by the Free Software Foundation.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program (see the file COPYING); if not, write to the
+# Free Software Foundation, Inc.,
+# 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA
+#
+################################################################
+
+BEGIN {
+  unshift @INC, ($::ENV{'BUILD_DIR'} || '/usr/lib/build');
+}
+
+use LWP::UserAgent;
+use URI;
+use File::Path;
+use File::Basename;
+
+use strict;
+
+sub get_zypp_baseurl {
+  my ($reponame) = @_;
+  require Build::Zypp;
+  my $repo = Build::Zypp::parserepo($reponame);
+  die("can't parse $reponame\n") unless $repo;
+  die "missing url in repo $repo->{'name'}\n" unless $repo->{'baseurl'};
+  return $repo->{'baseurl'};
+}
+
+die "USAGE: $0 DIR URLS..." unless $#ARGV >= 1;
+
+my $dir = shift @ARGV;
+
+my $ua = LWP::UserAgent->new(
+  agent => "openSUSE build script",
+  timeout => 42,
+  ssl_opts => {
+    verify_hostname => 1
+  });
+
+for my $url (@ARGV) {
+  if ($url =~ m#^zypp://#) {
+    die("do not know how to download $url\n") unless $url =~ m#^zypp://([^/]+)/((?:.*/)?([^/]+)\.rpm)$#;
+    my ($repo, $path, $pkg) = ($1, $2, $3);
+    my $dest = "$dir/$pkg.rpm";
+    system('/usr/bin/zypper', '--no-refresh', '-q', '--pkg-cache-dir', $dir,
+           'download', '-r', $repo, $pkg)
+	&& die("zypper download $pkg failed\n");
+    rename("$dir/$repo/$path", "$dest") || die("rename $dir/$repo/$path $dest: $!\n");
+    next;
+  }
+  $url = URI->new($url);
+  $ua->env_proxy;
+  my $dest = "$dir/".basename($url->path);
+  unlink($dest);	# just in case
+  my $retry = 3;
+  while ($retry--) {
+    my $res = $ua->mirror($url, $dest);
+    last if $res->is_success;
+    # if it's a redirect we probably got a bad mirror and should just retry
+    die "requesting $url failed: ".$res->status_line."\n" unless $retry && $res->previous;
+    warn "retrying $url\n";
+  }
+}
+
+# vim:sw=2

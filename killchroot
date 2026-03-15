@@ -1,0 +1,108 @@
+#!/usr/bin/perl
+
+################################################################
+#
+# Copyright (c) 1995-2014 SUSE Linux Products GmbH
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License version 2 or 3 as
+# published by the Free Software Foundation.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program (see the file COPYING); if not, write to the
+# Free Software Foundation, Inc.,
+# 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA
+#
+################################################################
+
+my $sig = 15;
+my $verbose = 0;
+my $msg = '';
+my $doit = 1;
+
+while (@ARGV) {
+  if ($ARGV[0] eq '-s' || $ARGV[0] eq '--signal') {
+    die("$ARGV[0]: argument required") unless @ARGV > 1;
+    $sig = $ARGV[1];
+    shift @ARGV;
+    shift @ARGV;
+    next;
+  }
+  if ($ARGV[0] eq '-v' || $ARGV[0] eq '--verbose') {
+    $verbose = 1;
+    shift @ARGV;
+    next;
+  }
+  if ($ARGV[0] eq '-n') {
+    $doit = 0;
+    $verbose = 1;
+    shift @ARGV;
+    next;
+  }
+  if ($ARGV[0] eq '-m' || $ARGV[0] eq '--message') {
+    die("$ARGV[0]: argument required") unless @ARGV > 1;
+    $msg = $ARGV[1];
+    shift @ARGV;
+    shift @ARGV;
+    next;
+  }
+  last;
+}
+
+die("usage: killchroot [-s sig] <rootdir>") unless @ARGV == 1 && $ARGV[0] ne '';
+my $dir = $ARGV[0];
+chdir($dir) || die("$dir: $!\n");
+
+$dir = readlink('/proc/self/cwd');
+die("readlink /proc/self/cwd: $!\n") unless defined $dir;
+
+my %pids;
+my $pid;
+my $path;
+
+opendir(D, "/proc") || die("/proc: $!\n");
+for $pid (readdir(D)) {
+  next unless $pid =~ /^\d+$/;
+  $path = readlink("/proc/$pid/root");
+  next unless defined $path;
+  if ($path =~ /^\Q$dir\E(\/.*)?$/) {
+    $pids{$pid} = 1;
+  }
+  $path = readlink("/proc/$pid/exe");
+  if ($path =~ /^\Q$dir\E(\/.*)?$/) {
+    $pids{$pid} = 1;
+  }
+}
+closedir(D);
+
+my @pids = sort keys %pids;
+exit 0 unless @pids;
+
+print "$msg\n" if $msg ne '';
+
+if ($verbose) {
+  my @pidsv = ();
+  for $pid (@pids) {
+    open(F, "</proc/$pid/cmdline");
+    my $cmd = '';
+    sysread(F, $cmd, 128);
+    close F;
+    $cmd =~ s/\0.*//;
+    #$cmd =~ s/ .*//;
+    push @pidsv, "$pid($cmd)";
+  }
+  if (@pids > 1) {
+    print "sending signal $sig to processes @pidsv\n";
+  } else {
+    print "sending signal $sig to process @pidsv\n";
+  }
+}
+exit 0 unless $doit;
+kill $sig => @pids;
+kill CONT => @pids if $sig eq 9;
+exit 0;

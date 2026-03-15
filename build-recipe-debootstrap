@@ -1,0 +1,117 @@
+#
+# debootstrap specific functions.
+#
+################################################################
+#
+# Copyright (c) 1995-2014 SUSE Linux Products GmbH
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License version 2 or 3 as
+# published by the Free Software Foundation.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program (see the file COPYING); if not, write to the
+# Free Software Foundation, Inc.,
+# 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA
+#
+################################################################
+
+recipe_setup_debootstrap() {
+    recipe_setup_dsc "$@"
+}
+
+recipe_prepare_debootstrap() {
+    recipe_prepare_dsc "$@"
+}
+
+recipe_build_debootstrap() {
+    local arch=$(chroot $BUILD_ROOT su -c "dpkg-architecture -qDEB_BUILD_ARCH")
+    if chroot $BUILD_ROOT grep -q '/sid' /etc/debian_version ; then
+        local dist=unstable
+    else
+        local dist=$(chroot $BUILD_ROOT su -c "lsb_release --codename --short")
+    fi
+    local myroot=debootstraproot
+    test -d $BUILD_ROOT/.build.binaries || cleanup_and_exit 1
+    if test "$DO_INIT" = true -o ! -d "$BUILD_ROOT/.build.binaries/dists" ; then
+	echo "creating repository for debootstrap..."
+	createrepo_debian $BUILD_ROOT/.build.binaries ${arch} ${dist}
+    fi
+    FULL_PKG_LIST=
+    for PKG in $BUILD_ROOT/.build.binaries/*.deb ; do
+	PKG="${PKG##*/}"
+	FULL_PKG_LIST="$FULL_PKG_LIST,${PKG%.deb}"
+    done
+    FULL_PKG_LIST="${FULL_PKG_LIST#,}"
+    rm -rf "$BUILD_ROOT/$myroot"
+    if chroot $BUILD_ROOT dpkg --force-unsafe-io --version >/dev/null 2>&1 ; then
+	mkdir -p "$BUILD_ROOT/$myroot/etc/dpkg/dpkg.cfg.d"
+	echo force-unsafe-io > "$BUILD_ROOT/$myroot/etc/dpkg/dpkg.cfg.d/force-unsafe-io"
+    fi
+
+    set -- chroot $BUILD_ROOT debootstrap --keep-debootstrap-dir --no-check-gpg --variant=buildd --arch="${arch}" --include="$FULL_PKG_LIST" "$dist" "$myroot" file:///.build.binaries
+    echo "running debootstrap..."
+    if ! "$@" || ! chroot $BUILD_ROOT dpkg --configure -a; then
+        cat $BUILD_ROOT/$myroot/debootstrap/debootstrap.log
+        cleanup_and_exit 1 "Failed to setup debootstrap chroot"
+    fi
+
+    # adapt passwd
+    if test $BUILD_USER = abuild ; then
+	echo "abuild:x:${ABUILD_UID}:${ABUILD_GID}:Autobuild:/home/abuild:/bin/bash" >>$BUILD_ROOT/$myroot/etc/passwd
+	echo 'abuild:*:::::::' >>$BUILD_ROOT/$myroot/etc/shadow
+	echo 'abuild:*::' >>$BUILD_ROOT/$myroot/etc/gshadow
+	echo "abuild:x:${ABUILD_GID}:" >>$BUILD_ROOT/$myroot/etc/group
+	mkdir -p $BUILD_ROOT/$myroot/home/abuild
+	chown "$ABUILD_UID:$ABUILD_GID" $BUILD_ROOT/$myroot/home/abuild
+    fi
+
+    if ! test -e $BUILD_ROOT/$myroot/etc/hosts ; then
+        cp $BUILD_ROOT/etc/hosts $BUILD_ROOT/$myroot/etc/hosts
+    fi
+
+    # Mount special filesystem in the debootstrap build root
+    mount -n -tproc none $BUILD_ROOT/$myroot/proc
+    mount -n -tsysfs -o ro none $BUILD_ROOT/$myroot/sys
+    mount -n -tdevpts -omode=0620,ptmxmode=0666,gid=5,newinstance, none $BUILD_ROOT/$myroot/dev/pts
+    mkdir -p $BUILD_ROOT/$myroot/dev/shm
+    mount -n -ttmpfs none $BUILD_ROOT/$myroot/dev/shm
+
+    chroot $BUILD_ROOT/$myroot apt-cache gencaches
+
+    if ! test -e $BUILD_ROOT/$myroot/etc/hosts ; then
+        cp $BUILD_ROOT/etc/hosts $BUILD_ROOT/$myroot/etc/hosts
+    fi
+
+    # move topdir over
+    mv "$BUILD_ROOT/$TOPDIR" "$BUILD_ROOT/$myroot/${TOPDIR%/*}"
+
+    # do the build
+    dsc_build "$BUILD_ROOT/$myroot"
+
+    umount -n $BUILD_ROOT/$myroot/proc/sys/fs/binfmt_misc 2>/dev/null || true
+    umount -n $BUILD_ROOT/$myroot/proc
+    umount -n $BUILD_ROOT/$myroot/sys
+    umount -n $BUILD_ROOT/$myroot/dev/pts
+    umount -n $BUILD_ROOT/$myroot/dev/shm
+
+    # move topdir back
+    mv "$BUILD_ROOT/$myroot/$TOPDIR" "$BUILD_ROOT/${TOPDIR%/*}"
+
+    # move result
+    dsc_move_build_result
+}
+
+recipe_resultdirs_debootstrap() {
+    echo DEBS
+}
+
+recipe_cleanup_debootstrap() {
+    :
+}
+

@@ -1,0 +1,79 @@
+#!/usr/bin/perl -w
+
+################################################################
+#
+# Copyright (c) 2016 SUSE Linux Products GmbH
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License version 2 or 3 as
+# published by the Free Software Foundation.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program (see the file COPYING); if not, write to the
+# Free Software Foundation, Inc.,
+# 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA
+#
+################################################################
+
+BEGIN {
+  unshift @INC, ($::ENV{'BUILD_DIR'} || '/usr/lib/build');
+}
+
+use Build;
+use strict;
+
+sub getbuildid {
+  my ($pkg) = @_;
+  my $d = Build::query($pkg, 'evra' => 1, 'buildtime' => 1);
+  return $d ? Build::getbuildid($d) : undef;
+}
+
+if (@ARGV && $ARGV[0] eq 'cachecheck') {
+  my $pkg;
+  my $buildid;
+  my $dst;
+  while (<STDIN>) {
+    chomp;
+    if (/^PKG (\S+) (.+)$/) {
+      ($pkg, $buildid, $dst) = ($1, $2, undef);
+    } elsif (/^PKG (\S+)$/) {
+      ($pkg, $buildid, $dst) = ($1, undef, undef);
+    } elsif (/^DST (.+)$/) {
+      $dst = $1;
+      unlink($dst) if -e $dst;
+    } elsif (/^CACHE (.+)$/) {
+      next unless $dst;
+      my $cpkg = $1;
+      next unless -s $cpkg;
+      if ($buildid) {
+	my $bid = getbuildid($cpkg);
+	next unless $bid;
+	if ($bid =~ / 0-/) {
+	  my $buildid2 = $buildid;
+	  $buildid2 =~ s/ .*?-/0-/;
+	  next if $bid ne $buildid2;
+	} else {
+	  next if $bid ne $buildid;
+ 	}
+      }
+      symlink($cpkg, $dst);
+      $dst = undef;	# first hit wins
+    }
+  }
+  exit(0);
+}
+
+while (<STDIN>) {
+  chomp;
+  my $dst = $_;
+  my $buildid = getbuildid($dst);
+  next unless $buildid;
+  open(F, '>', "$dst.buildid") || next;
+  print F "$buildid\n";
+  close(F);
+}

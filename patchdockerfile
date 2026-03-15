@@ -1,0 +1,59 @@
+#!/usr/bin/perl -w
+
+################################################################
+#
+# Copyright (c) 2020 SUSE Linux Products GmbH
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License version 2 or 3 as
+# published by the Free Software Foundation.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program (see the file COPYING); if not, write to the
+# Free Software Foundation, Inc.,
+# 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA
+#
+################################################################
+
+use strict;
+use warnings;
+
+my $install_docker_support = "COPY .obs-docker-support /usr/local/sbin/obs-docker-support\n" .
+                             "RUN obs-docker-support --install\n";
+my $uninstall_docker_support = "RUN obs-docker-support --uninstall\n";
+
+my @sections = ( [] );
+while (<STDIN>) {
+  $_ .= "\n" unless /\n$/s;
+  push @sections, [] if /^FROM\s/i;
+  push @{$sections[-1]}, $_;
+}
+
+# write out header unmodified
+print join('', @{shift @sections});
+
+for my $s (@sections) {
+  # analyze the section (first line is always FROM)
+  my ($install_idx, $uninstall_idx);
+  my $idx = 0;
+  for my $line (@$s) {
+    if ($line =~ /^[uU][sS][eE][rR]\s+root[\s\n]/) {
+      $install_idx = $idx unless defined $install_idx;
+      $uninstall_idx = undef;
+    } elsif ($line =~ /^[uU][sS][eE][rR]\s+/) {
+      $install_idx = 0 unless defined $install_idx;
+      $uninstall_idx = $idx unless defined $uninstall_idx;
+    }
+    $idx++;
+  }
+  # patch in commands
+  $s->[$install_idx || 0] .= $install_docker_support;
+  substr($s->[$uninstall_idx], 0, 0, $uninstall_docker_support) if defined $uninstall_idx;
+  $s->[-1] .= $uninstall_docker_support unless defined $uninstall_idx;
+  print join('', @$s);
+}

@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+    branches: [ '*' ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Install libyaml-libyaml-perl
+        run: |
+          sudo apt-get install libyaml-libyaml-perl
+
+      - name: Test
+        run: |
+          make test

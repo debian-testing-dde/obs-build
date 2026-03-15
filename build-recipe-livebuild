@@ -1,0 +1,280 @@
+#################################################################
+#
+# Debian live-build specific functions.
+#
+# Copyright (c) 2014,2015 Brocade Communications Systems, Inc.
+# Author: Jan Blunck <jblunck@infradead.org>
+#
+# This file is part of build.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License version 2 or 3 as
+# published by the Free Software Foundation.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program (see the file COPYING); if not, write to the
+# Free Software Foundation, Inc.,
+# 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA
+#
+#################################################################
+
+recipe_setup_livebuild() {
+    TOPDIR=/usr/src/packages
+    test "$DO_INIT_TOPDIR" = false || rm -rf "$BUILD_ROOT$TOPDIR"
+    for i in OTHER SOURCES LIVEBUILD_ROOT ; do
+	mkdir -p "$BUILD_ROOT$TOPDIR/$i"
+    done
+    chown -R "$ABUILD_UID:$ABUILD_GID" "$BUILD_ROOT$TOPDIR"
+    if test "$MYSRCDIR" = $BUILD_ROOT/.build-srcdir ; then
+	mv "$MYSRCDIR"/* $BUILD_ROOT$TOPDIR/SOURCES/
+    else
+	cp -p "$MYSRCDIR"/* $BUILD_ROOT$TOPDIR/SOURCES/
+    fi
+}
+
+recipe_prepare_livebuild() {
+    :
+}
+
+createrepo_debian() {
+    local DIR=${1}
+    local ARCH=${2}
+    local DIST=${3}
+
+    if [ -z "${DIR}" -o ! -d ${DIR} -o ${DIR} = ${DIR##${BUILD_ROOT}} ] ; then
+        return
+    fi
+
+    pushd ${DIR} >/dev/null
+
+    # cleanup existing repository files
+    rm -f Packages Packages.gz Release
+    rm -fr dists
+
+    mkdir -p dists/${DIST}
+
+    # create Packages and Sources files
+    mkdir -p dists/${DIST}/main/binary-${ARCH}
+    mkdir -p dists/${DIST}/main/source
+    cat > ${BUILD_ROOT}/.createrepo_debian.tmp.sh <<-EOF
+	cd /.build.binaries || exit 1
+	dpkg-scanpackages -m . > dists/${DIST}/main/binary-${ARCH}/Packages
+	gzip -c9 < dists/${DIST}/main/binary-${ARCH}/Packages \
+	    > dists/${DIST}/main/binary-${ARCH}/Packages.gz
+	dpkg-scansources . > dists/${DIST}/main/source/Sources
+	gzip -c9 dists/${DIST}/main/source/Sources \
+	    > dists/${DIST}/main/source/Sources.gz
+	EOF
+    chroot $BUILD_ROOT su -c "sh /.createrepo_debian.tmp.sh" - root
+    local RESULT=$?
+    rm -f $BUILD_ROOT/.createrepo_debian.tmp.sh
+    [ "${RESULT}" != 0 ] && return
+
+    # Only add symlinks after running dpkg-scanpackages to avoid
+    # https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=809219, which is at
+    # least present in the Ubuntu xenial version of dpkg
+    # Suite is symlinked to Codename
+    ln -s ${DIST} dists/stable
+
+    # create Release file
+    pushd dists/${DIST} >/dev/null
+    cat > Release <<-EOF
+	Origin: Debian
+	Label: Debian
+	Suite: stable
+	Version: 7.1
+	Codename: ${DIST}
+	Date: Sat, 15 Jun 2013 10:55:26 UTC
+	Description: Debian repository created by build-recipe-livebuild
+	Components: main
+	EOF
+    echo "SHA256:" >> Release
+    for file in main/binary-${ARCH}/Packages* ; do
+        local SUM=( $(sha256sum ${file}) )
+        local SIZE=$(stat -c '%s' ${file})
+        echo " ${SUM} ${SIZE} ${file}" >> Release
+    done
+    for file in main/source/Sources* ; do
+        local SUM=( $(sha256sum ${file}) )
+        local SIZE=$(stat -c '%s' ${file})
+        echo " ${SUM} ${SIZE} ${file}" >> Release
+    done
+    popd >/dev/null
+
+    # TODO: this is missing the signature with the private key
+
+    popd >/dev/null
+}
+
+# This script expects that the $BUILD_ROOT is a Debian installation with
+# live-build already installed!
+#
+# Variables:
+# $BUILD_ROOT the Debian chroot
+# $TOPDIR/SOURCES includes the live-build config tarball
+# $TOPDIR/$LIVEBUILD_ROOT where live-build will be called
+# $RECIPEFILE the name of the live-build config tarball
+
+recipe_build_livebuild() {
+    local ARCH=$(chroot $BUILD_ROOT su -c "dpkg-architecture -qDEB_BUILD_ARCH")
+    local DIST=$(chroot $BUILD_ROOT su -c "lsb_release --codename" | awk '{ print $2 }')
+    local LIVEBUILD_ROOT="LIVEBUILD_ROOT"
+
+    [ -z "${ARCH}" -o -z "${DIST}" ] && cleanup_and_exit 1
+
+    # https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=845651
+    # For our use case it makes sense to always return the testing codename,
+    # as creating a dependency on live-build-desc-sid would not make sense. In
+    # the example cited in the above bug, the metadata for sid would be incorrect
+    # anyway, and we would want the ones for potato.
+    if test "${DIST}" = "n/a" ; then
+	DIST=$(chroot $BUILD_ROOT su -c "sed 's/\(.*\)\/.*/\1/' /etc/debian_version")
+    fi
+
+    test -d $BUILD_ROOT/.build.binaries || cleanup_and_exit 1
+    if test "$DO_INIT" = true -o ! -d "$BUILD_ROOT/.build.binaries/dists" ; then
+	echo "creating repository metadata..."
+        createrepo_debian $BUILD_ROOT/.build.binaries ${ARCH} ${DIST}
+    fi
+
+    # Write our default configuration variables
+    mkdir -p $BUILD_ROOT/etc/live
+    cat > $BUILD_ROOT/etc/live/build.conf <<-EOF
+	LB_DEBIAN_INSTALLER_DISTRIBUTION="${DIST}"
+	LB_DISTRIBUTION="${DIST}"
+	LB_PARENT_DISTRIBUTION="${DIST}"
+	LB_PARENT_DEBIAN_INSTALLER_DISTRIBUTION="${DIST}"
+	LB_PARENT_MIRROR_BOOTSTRAP="file:/.build.binaries/"
+	LB_PARENT_MIRROR_CHROOT="file:/.build.binaries/"
+	LB_PARENT_MIRROR_CHROOT_SECURITY="file:/.build.binaries/"
+	LB_PARENT_MIRROR_BINARY="file:/.build.binaries/"
+	LB_PARENT_MIRROR_BINARY_SECURITY="file:/.build.binaries/"
+	LB_PARENT_MIRROR_DEBIAN_INSTALLER="file:/.build.binaries/"
+	LB_MIRROR_BOOTSTRAP="file:/.build.binaries/"
+	LB_MIRROR_CHROOT="file:/.build.binaries/"
+	LB_MIRROR_CHROOT_SECURITY="file:/.build.binaries/"
+	LB_MIRROR_BINARY="file:/.build.binaries/"
+	LB_MIRROR_BINARY_SECURITY="file:/.build.binaries/"
+	LB_MIRROR_DEBIAN_INSTALLER="file:/.build.binaries/"
+	LB_APT_SECURE="false"
+	LIVE_IMAGE_NAME="${RECIPEFILE%.livebuild}"
+	EOF
+
+    # Expand live-build configuration to $TOPDIR/$LIVEBUILD_ROOT
+    echo "Expanding live-build configuration"
+    tar -xvf $BUILD_ROOT/$TOPDIR/SOURCES/$RECIPEFILE \
+	-C $BUILD_ROOT/$TOPDIR/$LIVEBUILD_ROOT || cleanup_and_exit 1
+
+    # Skip top-level directory if it matches recipe name, ...
+    local files=($BUILD_ROOT/$TOPDIR/$LIVEBUILD_ROOT/*)
+    # ... but ignore some well known names
+    files=(${files[@]%%*/auto})
+    files=(${files[@]%%*/config})
+    files=(${files[@]%%*/local})
+    if [ ${#files[@]} -eq 1 ] && \
+	[ -d $BUILD_ROOT/$TOPDIR/$LIVEBUILD_ROOT/${RECIPEFILE%.livebuild} ]
+    then
+	LIVEBUILD_ROOT="LIVEBUILD_ROOT/${RECIPEFILE%.livebuild}"
+    fi
+
+    # Sanity check to not configure archives inside configuration
+    files=($BUILD_ROOT/$TOPDIR/$LIVEBUILD_ROOT/config/archives/*.chroot)
+    if [ ${#files[@]} -gt 0 ]; then
+        cleanup_and_exit 1 "E: No configuration in config/archives/*.chroot allowed"
+    fi
+
+    # TODO: Add the repository public key
+    # cp ... $BUILD_ROOT/$TOPDIR/$LIVEBUILD_ROOT/config/archives/debian.key
+
+    if [ -x $BUILD_ROOT/usr/lib/build/livebuild_pre_run ] ; then
+	echo "Running OBS build livebuild_pre_run hook"
+	chroot $BUILD_ROOT su -c \
+        "export RECIPEFILE=${RECIPEFILE}; /usr/lib/build/livebuild_pre_run" \
+        - root < /dev/null || cleanup_and_exit 1
+    fi
+
+    # TODO: this might move to lb auto/config file
+    if [ -f $BUILD_ROOT/$TOPDIR/SOURCES/livebuild_pre_run ] ; then
+	cp $BUILD_ROOT/$TOPDIR/SOURCES/livebuild_pre_run \
+	    $BUILD_ROOT/.build.livebuild_pre_run
+	chmod +x $BUILD_ROOT/.build.livebuild_pre_run
+	echo "Running package livebuild_pre_run hook"
+	chroot $BUILD_ROOT su -c \
+        "export RECIPEFILE=${RECIPEFILE}; /.build.livebuild_pre_run" \
+        - root < /dev/null || cleanup_and_exit 1
+    fi
+
+    chroot $BUILD_ROOT su -c "cd $TOPDIR/$LIVEBUILD_ROOT && lb build" - root \
+	< /dev/null || cleanup_and_exit 1
+
+    # extract build result basenames
+    local build_results=""
+    for i in $BUILD_ROOT/$TOPDIR/$LIVEBUILD_ROOT/* ; do
+	test -f "$i" || continue
+	case "${i##*/}" in
+	    *.hybrid.iso)
+		build_results="${build_results}\n${i%%.hybrid.iso}"
+		;;
+	    *.iso)
+		build_results="${build_results}\n${i%%.iso}"
+		;;
+	    *ONIE.bin)
+		build_results="${build_results}\n${i%%ONIE.bin}"
+		;;
+	    *.img)
+		build_results="${build_results}\n${i%%.img}"
+		;;
+	    *.netboot.tar*)
+		build_results="${build_results}\n${i%%.netboot.tar*}"
+		;;
+	    *.tar*)
+		build_results="${build_results}\n${i%%.tar*}"
+		;;
+	    *)
+		;;
+	esac
+    done
+
+    # Fail the build if no build results are found
+    if [ -z "${build_results}" ] ; then
+	cleanup_and_exit 1 "No live-build result found"
+    fi
+
+    # move created products (and their metadata files) to destination and
+    # create sha256 hashsums
+    local buildnum="${RELEASE:+-Build${RELEASE}}"
+    for prefix in $(echo -e "${build_results}" | sort | uniq) ; do
+	for f in ${prefix}.* ; do
+	    mv ${f} \
+		$BUILD_ROOT/$TOPDIR/OTHER/${prefix##*/}${buildnum}${f#${prefix}}
+	    # change directory to avoid having full path in hashsum file
+	    pushd $BUILD_ROOT/$TOPDIR/OTHER >/dev/null
+	    /usr/bin/sha256sum "${prefix##*/}${buildnum}${f#${prefix}}" > \
+		"${prefix##*/}${buildnum}${f#${prefix}}".sha256
+	    popd >/dev/null
+	    BUILD_SUCCEEDED=true
+	done
+    done
+
+    # copy recipe source tarball so that it can be published
+    cp "$BUILD_ROOT/$TOPDIR/SOURCES/$RECIPEFILE" \
+        "$BUILD_ROOT/$TOPDIR/OTHER/${RECIPEFILE%.livebuild}${buildnum}".livebuild.tar
+}
+
+recipe_resultdirs_livebuild() {
+    # our results are already in OTHER
+    :
+}
+
+recipe_cleanup_livebuild() {
+    :
+}
+
+# Local Variables:
+# mode: Shell-script
+# End:

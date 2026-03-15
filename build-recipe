@@ -1,0 +1,224 @@
+#
+# recipe specific functions for the build script
+#
+################################################################
+#
+# Copyright (c) 1995-2014 SUSE Linux Products GmbH
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License version 2 or 3 as
+# published by the Free Software Foundation.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program (see the file COPYING); if not, write to the
+# Free Software Foundation, Inc.,
+# 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA
+#
+################################################################
+
+
+BUILDTYPE=
+KIWI_PARAMETERS=
+
+for i in spec dsc kiwi arch collax preinstallimage simpleimage mock livebuild snapcraft debootstrap debbuild appimage docker podman fissile helm flatpak; do
+    . "$BUILD_DIR/build-recipe-$i"
+done
+
+recipe_setup() {
+    recipe_setup_$BUILDTYPE "$@"
+}
+
+recipe_prepare() {
+    recipe_prepare_$BUILDTYPE "$@"
+}
+
+recipe_build() {
+    recipe_build_$BUILDTYPE "$@"
+}
+
+
+recipe_resultdirs () {
+    recipe_resultdirs_$BUILDTYPE "$@"
+}
+
+recipe_cleanup () {
+    recipe_cleanup_$BUILDTYPE "$@"
+}
+
+recipe_parse_options() {
+    case ${PARAM/#--/-} in
+      -stage)
+	needarg
+	BUILD_RPM_BUILD_STAGE="$ARG"
+	shift
+	;;
+      -kiwi-parameter)
+	test -z "$ARG" && ARG="$1"
+	needarg
+	KIWI_PARAMETERS="$KIWI_PARAMETERS $ARG"
+	shift
+	;;
+      -*)
+	return 1
+	;;
+    esac
+    nextargs=("$@")
+    return 0
+}
+
+recipe_set_buildtype() {
+    BUILDTYPE=
+    case ${RECIPEFILE##_service:*:} in
+        *.spec|*.src.rpm) BUILDTYPE=spec ;;
+        *.dsc) BUILDTYPE=dsc ;;
+        *.kiwi) BUILDTYPE=kiwi ;;
+        PKGBUILD) BUILDTYPE=arch ;;
+        snapcraft.yaml) BUILDTYPE=snapcraft ;;
+        appimage.yml) BUILDTYPE=appimage ;;
+        Dockerfile) BUILDTYPE=docker ;;
+        fissile.yml) BUILDTYPE=fissile ;;
+        build.collax) BUILDTYPE=collax ;;
+        _preinstallimage) BUILDTYPE=preinstallimage ;;
+        simpleimage) BUILDTYPE=simpleimage ;;
+        *.livebuild) BUILDTYPE=livebuild ;;
+        Chart.yaml) BUILDTYPE=helm ;;
+        flatpak.yaml) BUILDTYPE=flatpak ;;
+        flatpak.yml) BUILDTYPE=flatpak ;;
+        flatpak.json) BUILDTYPE=flatpak ;;
+    esac
+    if test -z "$BUILDTYPE" ; then
+       cleanup_and_exit 1 "I don't know how to build $RECIPEFILE"
+    fi
+    # we can't query right after vm startup, so we put the BUILDENGINE in the build.data
+    if test -z "$RUNNING_IN_VM" ; then
+	BUILDENGINE=
+	if test -n "$BUILD_DIST" ; then
+	    BUILDENGINE=`queryconfig buildengine --dist "$BUILD_DIST" --configdir "$CONFIG_DIR" --archpath "$BUILD_ARCH"`
+	    test "$BUILDENGINE" = UNDEFINED && BUILDENGINE=
+	fi
+    fi
+    # tweak buildtype according to engine
+    if test "$BUILDENGINE" = mock -a "$BUILDTYPE" = spec ; then
+	BUILDTYPE=mock
+    fi
+    if test "$BUILDENGINE" = debootstrap -a "$BUILDTYPE" = dsc ; then
+	BUILDTYPE=debootstrap
+    fi
+    if test "$BUILDENGINE" = debbuild -a "$BUILDTYPE" = spec ; then
+	BUILDTYPE=debbuild
+    fi
+    if test "$BUILDENGINE" = podman -a "$BUILDTYPE" = docker ; then
+	BUILDTYPE=podman
+    fi
+}
+
+# expands all directories into files
+expand_recipe_directories() {
+    local f t ff found types
+    if test -z "$RECIPEFILES" ; then
+	set -- "`pwd`"
+    else
+	set -- "${RECIPEFILES[@]}"
+    fi
+    RECIPEFILES=()
+    for f in "$@" ; do
+	if test "$f" = "${f#/}" ; then
+	    f="`pwd`/$f"
+	fi
+	if test -d "$f" ; then
+	    if test -z "$types" ; then
+		if test -n "$BUILD_DIST" ; then
+		    case $(queryconfig --dist "$BUILD_DIST" --configdir "$CONFIG_DIR" --archpath "$BUILD_ARCH" type) in
+			dsc) types=".dsc" ;;
+			kiwi) types=".kiwi" ;;
+			arch) types="PKGBUILD" ;;
+			collax) types="build.collax" ;;
+			livebuild) types=".livebuild" ;;
+			snapcraft) types="snapcraft.yaml" ;;
+		    esac
+		fi
+		types="$types .spec .dsc PKGBUILD Dockerfile build.collax .kiwi .src.rpm .nosrc.rpm simpleimage snapcraft.yaml Chart.yaml flatpak.yaml flatpak.json"
+	    fi
+	    for t in $types ; do
+		found=
+		for ff in "$f"/*$t ; do
+		    test -f "$ff" || continue
+		    RECIPEFILES=("${RECIPEFILES[@]}" "$ff")
+		    found=true
+		done
+		test -n "$found" && break
+	    done
+	else
+	    RECIPEFILES[${#RECIPEFILES[@]}]="$f"
+	fi
+    done
+    if test -z "$RECIPEFILES" ; then
+	cleanup_and_exit 1 "no recipe files found in $@. exit..."
+    fi
+}
+
+# generate a .build-changelog file from a .changes file
+recipe_create_changelog() {
+   rm -f $BUILD_ROOT/.build-changelog
+   case $1 in
+	*.dsc) CFFORMAT=debian ;;
+	*) CFFORMAT=rpm ;;
+    esac
+    # add --emailonly option for sles builds
+    if test "$CFFORMAT" = rpm ; then
+	case `queryconfig --dist "$BUILD_DIST" --configdir "$CONFIG_DIR" --archpath "$BUILD_ARCH" eval '%{?is_opensuse}/%{?!fullname_in_changelog:%{?suse_version}}'` in
+	  *[1-9]*/*) ;;
+	  */*[1-9]*) CFFORMAT="$CFFORMAT --emailonly" ;;
+	esac
+    fi
+    echo "running changelog2spec --target $CFFORMAT --file $1"
+    if ! $BUILD_DIR/changelog2spec --target $CFFORMAT --file "$1" > $BUILD_ROOT/.build-changelog ; then 
+	rm -f $BUILD_ROOT/.build-changelog
+    fi
+}
+
+recipe_needs_build_binaries() {
+    test "$BUILDTYPE" = mock && return 0
+    test "$BUILDTYPE" = debootstrap && return 0
+    test "$BUILDTYPE" = livebuild && return 0
+    test "$BUILDTYPE" = snapcraft && return 0
+    test "$BUILDTYPE" = appimage && return 0
+    test "$BUILDTYPE" = docker && return 0
+    test "$BUILDTYPE" = fissile && return 0
+    test "$BUILDTYPE" = podman && return 0
+    grep -E '^#[[:blank:]]*needsbinariesforbuild[[:blank:]]*$' >/dev/null <"$1" && return 0
+    return 1
+}
+
+recipe_build_time_statistics() {
+    if test "$DO_STATISTICS" = 1 -a -n "$RECIPE_BUILD_START_TIME" -a -n "$TOPDIR" -a -n "$RUNNING_IN_VM" ; then
+	mkdir -p "$TOPDIR/OTHER"
+	echo "TIME_main_build: $(( `date +%s` - $RECIPE_BUILD_START_TIME))"  >> "$TOPDIR/OTHER/_statistics"
+	RECIPE_BUILD_START_TIME=
+    fi
+}
+
+recipe_gendiff() {
+    local obsgendiff=$(queryconfig \
+            --dist "$BUILD_DIST" --configdir "$CONFIG_DIR" \
+            --archpath "$BUILD_ARCH" buildflags obsgendiff
+        )
+
+    if test -n "$obsgendiff"; then
+         if test -d "$BUILD_ROOT/usr/lib/build/obsgendiff.d"; then
+             for script in "$BUILD_ROOT"/usr/lib/build/obsgendiff.d/*; do
+                 if test -x "$script" && ! chroot "$BUILD_ROOT" "/usr/lib/build/obsgendiff.d/${script##*/}" ; then
+                     cleanup_and_exit 1 "/usr/lib/build/obsgendiff.d/${script##*/} script failed!"
+                 fi
+             done
+         else
+             cleanup_and_exit 1 "obsgendiff enabled but no script installed"
+         fi
+    fi
+}
+
